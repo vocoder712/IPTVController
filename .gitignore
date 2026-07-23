@@ -14,6 +14,7 @@
 /build/
 /dist/
 /out/
+/.cache/
 
 # 如果直接执行：
 # go build

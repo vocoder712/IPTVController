@@ -1,5 +1,9 @@
 .PHONY: test run build-arm
 
+export GOCACHE := $(CURDIR)/.cache/go-build
+export GOMODCACHE := $(CURDIR)/.cache/go-mod
+export GOPATH := $(CURDIR)/.cache/gopath
+
 test:
 	go test ./...
 
