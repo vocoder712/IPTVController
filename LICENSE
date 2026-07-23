@@ -1,0 +1,137 @@
+# =========================
+# Go 编译产物
+# =========================
+
+# 可执行文件与动态库
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 常见的本地构建输出目录
+/bin/
+/build/
+/dist/
+/out/
+
+# 如果直接执行：
+# go build
+# 并在项目根目录生成与项目同名的程序，
+# 可以单独添加生成的文件名，例如：
+# /my-project
+# /my-project.exe
+
+
+# =========================
+# Go 测试与性能分析
+# =========================
+
+# go test -c 生成的测试程序
+*.test
+
+# 覆盖率和测试输出
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# CPU、内存等性能分析文件
+*.prof
+*.pprof
+
+# Fuzz 测试缓存/失败样本
+testdata/fuzz/*
+
+
+# =========================
+# Go 工作区
+# =========================
+
+# go.work 通常只用于本地多模块开发
+go.work
+go.work.sum
+
+
+# =========================
+# 依赖
+# =========================
+
+# 一般不要忽略 go.mod 和 go.sum：
+# 它们应当提交到 Git
+
+# 是否提交 vendor 取决于项目策略
+# vendor/
+
+
+# =========================
+# 环境变量与本地配置
+# =========================
+
+.env
+.env.*
+!.env.example
+
+*.local
+config.local.*
+settings.local.*
+
+
+# =========================
+# 日志与临时文件
+# =========================
+
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+tmp/
+temp/
+
+
+# =========================
+# IDE / 编辑器
+# =========================
+
+# JetBrains GoLand / IntelliJ / Rider
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Vim
+Session.vim
+
+# Emacs
+\#*\#
+.#*
+
+
+# =========================
+# 操作系统文件
+# =========================
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
+
+
+# =========================
+# Docker / 本地运行数据
+# =========================
+
+docker-data/
+data/
+logs/
