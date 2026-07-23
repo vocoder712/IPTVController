@@ -24,6 +24,8 @@ IPTV VLAN/组播分析或厂商网页 API。阶段计划以 `.codex/PLAN.md` 为
 ## 设备与运行环境
 
 - 设备：SG631Z，ARMv7，Linux 4.19。
+- `/proc/cpuinfo` 的 Features 不含 `vfp`/`vfpv3`；Go 交叉构建必须使用
+  `GOARM=5`。`GOARM=7` 能编译，但在设备启动时报 `Illegal instruction`。
 - LAN2 对应 Linux 接口 `eth1`，已通过实机测试确认。
 - OpenWrt 位于 `ufw` LXC，与主系统共享 network/user namespace，容器可见
   `eth0` 至 `eth3`，并具备控制网络接口所需能力。
@@ -108,7 +110,7 @@ go.mod                         Go 1.22，无第三方依赖
 - 状态和最后一次手动状态的原子 JSON 持久化；
 - 定期读取、状态对账和厂商进程回拉检测；
 - 完整启动能力检查（namespace、CAP_NET_ADMIN、`/bin/ip` 可执行性等）；
-- 设备端服务的可靠部署、启动和重启后自动运行验证；
+- 设备重启后服务自动运行验证；
 - 设备端 HTTP API/H5 的端到端真实开关验证；
 - 观察 1 至 5 分钟以确认厂商进程是否会自动回拉接口。
 
@@ -145,10 +147,13 @@ go.mod                         Go 1.22，无第三方依赖
 
 ### HTTP 服务
 
-2026-07-23 检查时，`192.168.1.1:8088` 可建立 TCP 连接，但
-`GET /healthz` 和 `GET /api/v1/status` 均在 5 秒内无响应。当前不能据此
-确认仓库中的最新版服务已经正确部署或运行，实机控制仍以 Telnet 后直接执行
-`ip link` 为已验证路径。
+2026-07-23 早期检查时，`192.168.1.1:8088` 可建立 TCP 连接但 HTTP
+无响应。部署当前 GOARM=5 构建后该问题已消失：
+
+- 模拟服务 PID 为 `15948`，监听 `192.168.1.1:8088`。
+- 日志明确显示 `real=false`，进程环境中没有 `IPTV_CONTROL_REAL`。
+- `/healthz`、状态 API、模拟开关 API 和 H5 首页均验证通过。
+- 服务已安装到持久目录，但尚未通过设备重启验证开机自动运行。
 
 ## 本地验证基线
 
@@ -157,7 +162,9 @@ go.mod                         Go 1.22，无第三方依赖
 - `go test ./...`：通过。
 - `go test -race ./...`：通过。
 - `go vet ./...`：通过。
-- `GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build ...`：通过。
+- `GOARM=7` 构建能完成，但设备运行时报 `Illegal instruction`，不可使用。
+- `GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build ...`：通过，并已
+  在设备上成功运行。
 - 生成的 `dist/iptv-control` 大小约 6,160,546 bytes。
 - Go 模块：`iptvcontrol`，Go 版本 1.22。
 - 本地开发模式已在 `127.0.0.1:8088` 跑通：
@@ -179,7 +186,7 @@ go test ./...
 
 $env:GOOS = "linux"
 $env:GOARCH = "arm"
-$env:GOARM = "7"
+$env:GOARM = "5"
 $env:CGO_ENABLED = "0"
 go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 ```
@@ -200,27 +207,37 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 优先顺序建议如下：
 
-1. 查明设备 8088 端口“TCP 可连接但 HTTP 无响应”的进程、日志和部署版本。
-2. 完善启动能力检查，包括 `/bin/ip`、接口、root 和能力信息。
-3. 将通过测试的 ARMv7 二进制部署到持久目录，以模拟模式验证 H5/API。
-4. 在明确的恢复兜底下启用 `IPTV_CONTROL_REAL=1`，完成 API 端到端开关测试。
-5. 实现原子状态持久化、周期对账及厂商回拉检测。
+1. 完善启动能力检查，包括 `/bin/ip`、接口、root 和能力信息。
+2. 在合适时机重启设备，验证持久启动脚本能自动恢复模拟服务。
+3. 在明确的恢复兜底下启用 `IPTV_CONTROL_REAL=1`，完成 API 端到端开关测试。
+4. 实现原子状态持久化、周期对账及厂商回拉检测。
 
 ## 当前任务
 
-任务：跑通本地开发模式，包括测试、服务启动、API 和 H5 页面交互验证。
+任务：将当前 ARMv7 构建部署到 SG631Z 持久目录，并以设备模拟模式验证
+HTTP API 和 H5。
 
 状态：已完成。
 
 完成结果：
 
-- `go test ./...` 通过。
-- 明确清除 `IPTV_CONTROL_REAL` 后在 `127.0.0.1:8088` 启动本地 Windows
-  开发程序，确认日志为 `real=false`。
-- health、status、模拟开启和模拟关闭 API 均通过。
-- 首页返回 HTTP 200，H5 关键控件和 API 脚本检查通过。
-- 浏览器连接器因环境元数据问题未能完成真实点击验证，已记录为验证环境限制，
-  不是应用故障。
-- 首次前台长运行调用曾造成约 5 分钟阻塞；随后改用可立即返回且可显式终止
-  的受控测试会话完成验证。今后不要通过阻塞式 shell 调用启动长运行服务。
-- 测试服务已终止，无残留进程；未连接光猫、未操作真实 LAN2。
+- 本地 `go test ./...` 通过。
+- 初始 GOARM=7 二进制上传和 SHA-256 校验成功，但设备因 CPU 无 VFP 支持
+  报 `Illegal instruction`；服务未启动，未触发任何端口控制。
+- 改用 `GOARM=5` 重新构建、上传和校验。正式二进制：
+  - 路径：`/opt/cu/apps/apps/opt/apps/iptv-control/iptv-control`
+  - 大小：6,160,546 bytes
+  - SHA-256：`202ff3c4fdcf062ffacd468a0deb94e3cbc56f15ecc773cf8867a2fa1a64b75b`
+- 启动脚本已安装到
+  `/opt/cu/apps/apps/root/scripts/iptv-control-start.sh`，SHA-256 为
+  `da209ee5ed781e102e1f9e6dbd41dc5d3002fd68f74c995f3727f24c9b2e4a74`，
+  `IPTV_CONTROL_REAL=1` 保持注释。
+- 模拟服务 PID `15948` 正常监听 `192.168.1.1:8088`，日志为
+  `interface=eth1 real=false`。
+- `/healthz` 返回 `ok=true`、`real_control=false`；状态返回
+  `capability_check=simulation`；模拟开启、关闭和 H5 HTTP 200 均通过。
+- 模拟 API 操作前后，真实 `eth1` 都保持管理 UP、无载波、
+  `operstate=down`、`carrier=0`，确认未修改 LAN2。
+- 已删除 `/var` 的两个上传临时文件和持久目录中的 GOARM=7 不兼容副本；
+  这些设备文件不可恢复，但可从本地源码重新构建。
+- 未重启光猫，未启用真实模式，未执行真实端口开关。

@@ -11,4 +11,4 @@ run:
 	go run ./cmd/iptv-control
 
 build-arm:
-	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
+	GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control

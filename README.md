@@ -42,10 +42,14 @@ go run ./cmd/iptv-control
 ```powershell
 $env:GOOS = "linux"
 $env:GOARCH = "arm"
-$env:GOARM = "7"
+$env:GOARM = "5"
 $env:CGO_ENABLED = "0"
 go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 ```
+
+SG631Z 虽然报告 ARMv7，但实测 CPU Features 不包含 VFP。必须使用
+`GOARM=5` 的软浮点兼容构建；`GOARM=7` 二进制会在启动时报告
+`Illegal instruction`。
 
 生成文件为 `dist/iptv-control`。先以设备模拟模式验证程序和 HTTP 服务，
 确认无误后再显式启用实际模式。
