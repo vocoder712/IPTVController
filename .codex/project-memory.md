@@ -37,6 +37,10 @@ IPTV VLAN/组播分析或厂商网页 API。阶段计划以 `.codex/PLAN.md` 为
   `/opt/cu/apps/apps/etc/init.d/done` 在 `START=95` 的 `boot()` 中只调用
   固定入口 `/root/scripts/bootshell.sh`；自定义服务必须由
   `bootshell.sh` 显式启动。
+- **部署硬约束：需要以 OpenWrt/LXC 容器进程运行的服务，只能通过修改持久
+  固定入口 `bootshell.sh` 后重启光猫来启动。Telnet 位于主系统视角；通过
+  Telnet 直接启动的进程永远不等同于可长期部署的容器进程，也不能作为容器
+  启动或运行验收结果。**
 - 光猫根文件系统和部分运行目录易失，设备每天可能自动重启；Telnet 重启后
   会关闭。
 - 设备可用空间很少，应使用精简日志并优先写入 `/var` 等易失目录。
@@ -74,7 +78,8 @@ go.mod                         Go 1.22，无第三方依赖
   - `GET /api/v1/status`
   - `POST /api/v1/port`，请求体为 `{"enabled": true|false}`
   - `GET /healthz`
-- 真实模式通过 `/bin/ip link set dev <iface> up|down` 控制接口。
+- 真实模式通过配置的 `ip link set dev <iface> up|down` 控制接口；程序默认
+  为 `/bin/ip`，SG631Z 容器部署必须显式配置为 `/sbin/ip`。
 - 非真实模式不会读取 `/sys` 或执行 `ip link`，开关状态会稳定保存在进程
   内存中，便于 Windows 等本地环境开发。
 - 真实模式要求进程 EUID 为 root。
@@ -212,23 +217,40 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 ## 建议下一步
 
-优先顺序建议如下：
-
-1. 完善启动能力检查，包括 `/bin/ip`、接口、root 和能力信息。
-2. 在合适时机重启设备，验证持久启动脚本能自动恢复模拟服务。
-3. 在明确的恢复兜底下启用 `IPTV_CONTROL_REAL=1`，完成 API 端到端开关测试。
-4. 实现原子状态持久化、周期对账及厂商回拉检测。
+进入第二阶段“智能限时”，详细状态机、默认参数、实现任务和安全约束见
+`.codex/PLAN.md`。优先实现可测试的状态机与配置，再补持久化、API/H5，
+最后使用缩短参数做设备实机验证。
 
 ## 当前任务
 
-任务：评估设备是否已具备全真运行条件，重点复核 OpenWrt 容器
-操作真实 `eth1` 的 namespace、root、工具和 `CAP_NET_ADMIN` 能力。
+任务（2026-07-24）：电视已经启动，继续此前暂停的能力诊断，并使用
+`docs/credential.json` 中结构化凭据连接设备，完成设备实际模式的全真运行
+验证。
 
-状态：进行中。
+状态：已完成。
 
-验证边界：只读取 namespace、进程能力位、容器路径、`eth1` 和
-`/bin/ip` 状态；不设置 `IPTV_CONTROL_REAL=1`，不执行 `ip link set`，
-不操作真实 LAN2。
+验证边界：允许在确认管理连接不依赖 LAN2、真实状态读取正常且延迟恢复兜底
+已经启动后，设置 `IPTV_CONTROL_REAL=1` 并通过 HTTP API 对 `eth1` 执行一次
+短时 down/up；必须确认接口恢复、电视业务产生预期短暂断连且服务仍可访问。
+凭据只用于连接，不复制到代码、日志或本记忆文件。
+
+执行纠正（2026-07-24）：尝试从 Telnet 主系统 shell 使用容器路径重启服务，
+旧模拟进程已停止，但 `/opt/apps/...` 在主系统视角不可见，新进程未启动。
+后续不再通过 Telnet 启动替代进程；按部署硬约束修改持久
+`bootshell.sh`、校验后重启光猫，由固定入口产生真实容器进程。
+
+完成结果（2026-07-24）：
+
+- root、能力位、`eth1`、容器视角脚本和二进制检查通过。
+- 固定入口已启用 `IPTV_CONTROL_REAL=1`，并修正
+  `IPTV_CONTROL_IP=/sbin/ip`；真实重启后 `/healthz` 返回
+  `real_control=true`，H5 和状态 API 可用。
+- 发现并纠正了主系统 `/bin/ip` 与容器 `/sbin/ip` 的路径差异；不能用
+  Telnet 主系统的工具检查结果替代容器视角检查。
+- 用户已手动完成真实开关验收，确认 API 能正确开启和关闭 LAN2。
+- 载波语义经实机确认：机顶盒开机且 LAN2 启用时 `carrier=1`，机顶盒关机
+  或 LAN2 关闭时 `carrier=0`。
+- 第一阶段完成；下一任务为可配置的智能限时功能。
 
 2026-07-24 继续执行：重新上传 `deploy/bootshell.sh` 后，将同时通过主系统
 持久路径和运行中容器进程的 `/proc/<pid>/root` 视角验证文件与二进制。只有

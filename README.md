@@ -73,13 +73,13 @@ export IPTV_CONTROL_REAL=1
 实际模式下，关闭按钮会执行：
 
 ```sh
-/bin/ip link set dev eth1 down
+/sbin/ip link set dev eth1 down
 ```
 
 开启按钮会执行：
 
 ```sh
-/bin/ip link set dev eth1 up
+/sbin/ip link set dev eth1 up
 ```
 
 完整的设备模拟部署、实际部署、API 调用、安全切换和故障排查步骤见
