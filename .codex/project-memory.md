@@ -361,6 +361,40 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 ---
 
+任务（2026-07-24）：增加手动触发的 GitHub Actions Release 工作流；运行后
+自动发布由 Actions run number 决定版本的 Release，附件包含 SG631Z 可部署
+二进制和 `bootshell.sh`。
+
+状态：进行中，先检查仓库现有工作流和发布约定；对影响 tag/产物格式的不确定
+项向用户确认后实现。
+
+完成结果（2026-07-24）：
+
+- 用户确认发布格式：
+  - Tag：`v<github.run_number>`；
+  - 标题：`IPTVController v<github.run_number>`；
+  - 两个独立附件：`iptv-control`、`bootshell.sh`；
+  - 正式 Release，自动生成 Release Notes。
+- 新增 `.github/workflows/release.yml`：
+  - 唯一触发器为 `workflow_dispatch`，不会响应 push/tag；
+  - 最小权限为 `contents: write`；
+  - 使用 `actions/checkout@v4`、`actions/setup-go@v5`；
+  - 先执行 `go test ./...`；
+  - 固定 `GOOS=linux`、`GOARCH=arm`、`GOARM=5`、`CGO_ENABLED=0`，
+    使用 `-trimpath -ldflags="-s -w"` 构建设备可部署二进制；
+  - 将 `deploy/bootshell.sh` 以 0755 权限复制为 Release 附件；
+  - 使用 GitHub Runner 自带官方 `gh release create` 和当前
+    `github.token` 创建 Tag/正式 Release，设为 latest 并生成说明。
+- README 已增加手动触发、版本规则、附件和同一 run 重新运行会因版本已存在
+  而失败的说明。
+- 本地验证通过：`go test ./...`、相同参数 GOARM=5 构建、PyYAML BaseLoader
+  解析和结构断言、`git diff --check`；产物名称和文件大小检查通过。
+- 本轮只新增工作流并做本地验证，未实际触发 GitHub Actions 或创建 Release。
+
+状态：已完成。
+
+---
+
 任务（2026-07-24）：修复儿童通过短暂拔网线绕过智能限时；增加 30 分钟
 冷却锁定、观看期间家长手动进入干预，以及修改观看/阻断参数不清空当前状态。
 本地逻辑验证通过后直接部署光猫。

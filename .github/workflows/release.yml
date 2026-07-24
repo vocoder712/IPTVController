@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build deployable files
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "5"
+        run: |
+          mkdir -p release
+          go build -trimpath -ldflags="-s -w" \
+            -o release/iptv-control ./cmd/iptv-control
+          install -m 0755 deploy/bootshell.sh release/bootshell.sh
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: v${{ github.run_number }}
+        run: |
+          gh release create "$VERSION" \
+            release/iptv-control \
+            release/bootshell.sh \
+            --target "$GITHUB_SHA" \
+            --title "IPTVController $VERSION" \
+            --generate-notes \
+            --latest

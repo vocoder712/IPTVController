@@ -1,7 +1,26 @@
 # IPTVController
 
-面向 SG631Z 光猫 LAN2 IPTV 端口的轻量控制服务。第一阶段提供状态查询、
-HTTP API 和 H5 手动开关，不包含定时计划或认证。
+> ### 你是否在为家里的儿童看电视时间过长而烦恼？
+>
+> ### 你是否在为家里的儿童看电视时间过长而烦恼？
+> 
+> ### 你是否在为家里的儿童看电视时间过长而烦恼？
+>
+> #### 如果你使用的是 SG631Z 光猫，本文档介绍的 IPTVController 可以帮助你轻松控制 LAN2 IPTV 端口的开关和观看时间。帮助你管理儿童的电视观看时间，避免过度沉迷。
+
+## 开箱即用教程
+
+### 前提条件
+
+- SG631Z 光猫
+- 已经拥有 telnet 超级用户登录权限
+
+### 部署
+
+- 下载 IPTVController 的最新版本，解压到光猫的 LXC 容器 APP 目录 `/opt/cu/apps/apps/opt/apps`，新建目录 `iptv-control`，将解压后的文件放入该目录。
+- 下载 bootshell.sh 脚本，替换 `/opt/cu/apps/apps/root/scripts/bootshell.sh` 文件。确保上传之后的脚本具有可执行权限。
+- 重启光猫。
+- 访问 <http://192.168.1.1:8088/>，即可看到 IPTVController 的 H5 页面。
 
 ## 三种运行方式
 
