@@ -221,10 +221,14 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 ## 当前任务
 
-任务：按用户要求改为只使用 `bootshell.sh`，删除独立
-`iptv-control-start.sh`，修正设备启动入口并重启验证。
+任务：评估设备是否已具备全真运行条件，重点复核 OpenWrt 容器
+操作真实 `eth1` 的 namespace、root、工具和 `CAP_NET_ADMIN` 能力。
 
-状态：已完成。
+状态：进行中。
+
+验证边界：只读取 namespace、进程能力位、容器路径、`eth1` 和
+`/bin/ip` 状态；不设置 `IPTV_CONTROL_REAL=1`，不执行 `ip link set`，
+不操作真实 LAN2。
 
 2026-07-24 继续执行：重新上传 `deploy/bootshell.sh` 后，将同时通过主系统
 持久路径和运行中容器进程的 `/proc/<pid>/root` 视角验证文件与二进制。只有
