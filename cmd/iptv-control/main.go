@@ -24,14 +24,16 @@ import (
 var webFS embed.FS
 
 type PortStatus struct {
-	Interface       string    `json:"interface"`
-	Enabled         bool      `json:"enabled"`
-	AdminUp         bool      `json:"admin_up"`
-	OperState       string    `json:"oper_state"`
-	Carrier         string    `json:"carrier"`
-	LastChange      time.Time `json:"last_change,omitempty"`
-	LastError       string    `json:"last_error,omitempty"`
-	CapabilityCheck string    `json:"capability_check"`
+	Interface       string           `json:"interface"`
+	Enabled         bool             `json:"enabled"`
+	AdminUp         bool             `json:"admin_up"`
+	OperState       string           `json:"oper_state"`
+	Carrier         string           `json:"carrier"`
+	CarrierSource   string           `json:"carrier_source"`
+	LastChange      time.Time        `json:"last_change,omitempty"`
+	LastError       string           `json:"last_error,omitempty"`
+	CapabilityCheck string           `json:"capability_check"`
+	Limiter         *LimiterSnapshot `json:"limiter,omitempty"`
 }
 
 type PortController interface {
@@ -40,25 +42,32 @@ type PortController interface {
 }
 
 type ipController struct {
-	iface, ip   string
-	sysClassNet string
-	real        bool
-	now         func() time.Time
-	mu          sync.Mutex
-	last        PortStatus
+	iface, ip     string
+	dbusSend      string
+	sysClassNet   string
+	real          bool
+	now           func() time.Time
+	commandOutput func(context.Context, string, ...string) ([]byte, error)
+	mu            sync.Mutex
+	last          PortStatus
 }
 
 func newIPController(iface, ip string, real bool) *ipController {
 	return &ipController{
 		iface:       iface,
 		ip:          ip,
+		dbusSend:    "/usr/bin/dbus-send",
 		sysClassNet: "/sys/class/net",
 		real:        real,
 		now:         time.Now,
+		commandOutput: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		},
 		last: PortStatus{
 			Interface:       iface,
 			OperState:       "simulated",
 			Carrier:         "simulated",
+			CarrierSource:   "simulation",
 			CapabilityCheck: "simulation",
 		},
 	}
@@ -98,15 +107,58 @@ func (c *ipController) Status(ctx context.Context) (PortStatus, error) {
 	}
 	p.OperState = strings.TrimSpace(string(state))
 
-	carrier, err := os.ReadFile(filepath.Join(ifacePath, "carrier"))
+	carrier, err := c.readLAN2Status(ctx)
 	if err != nil {
-		return c.statusError(p, fmt.Errorf("read carrier: %w", err))
+		return c.statusError(p, err)
 	}
-	p.Carrier = strings.TrimSpace(string(carrier))
+	p.Carrier = carrier
+	p.CarrierSource = "dbus_lan2_status"
 	p.Enabled = p.AdminUp
-	p.CapabilityCheck = "interface_visible"
+	p.CapabilityCheck = "interface_and_dbus_visible"
 	c.last = p
 	return p, nil
+}
+
+func (c *ipController) readLAN2Status(ctx context.Context) (string, error) {
+	output, err := c.commandOutput(
+		ctx,
+		c.dbusSend,
+		"--system",
+		"--type=method_call",
+		"--print-reply",
+		"--reply-timeout=3000",
+		"--dest=com.cuc.igd1",
+		"/com/cuc/igd1/Info/Network",
+		"org.freedesktop.DBus.Properties.Get",
+		"string:com.cuc.igd1.NetworkInfo",
+		"string:LAN2Status",
+	)
+	if err != nil {
+		return "", fmt.Errorf("read LAN2Status via DBus: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	status, err := parseLAN2Status(output)
+	if err != nil {
+		return "", fmt.Errorf("read LAN2Status via DBus: %w", err)
+	}
+	return status, nil
+}
+
+func parseLAN2Status(output []byte) (string, error) {
+	fields := strings.Fields(string(output))
+	var status string
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] != "byte" || (fields[i+1] != "0" && fields[i+1] != "1") {
+			continue
+		}
+		if status != "" {
+			return "", fmt.Errorf("ambiguous output %q", strings.TrimSpace(string(output)))
+		}
+		status = fields[i+1]
+	}
+	if status == "" {
+		return "", fmt.Errorf("unexpected output %q", strings.TrimSpace(string(output)))
+	}
+	return status, nil
 }
 
 func (c *ipController) statusError(p PortStatus, err error) (PortStatus, error) {
@@ -132,6 +184,7 @@ func (c *ipController) SetEnabled(ctx context.Context, enabled bool) error {
 		c.last.AdminUp = enabled
 		c.last.OperState = "simulated"
 		c.last.Carrier = "simulated"
+		c.last.CarrierSource = "simulation"
 		c.last.LastChange = c.now()
 		c.last.LastError = ""
 		c.last.CapabilityCheck = "simulation"
@@ -159,12 +212,26 @@ func (c *ipController) SetEnabled(ctx context.Context, enabled bool) error {
 
 type app struct {
 	controller PortController
+	limiter    *limiterMachine
+	persister  *statePersister
+	now        func() time.Time
 }
 
 func (a *app) readStatus(ctx context.Context) PortStatus {
 	s, err := a.controller.Status(ctx)
 	if err != nil {
 		s.LastError = err.Error()
+	}
+	if a.limiter != nil {
+		now := time.Now()
+		if a.now != nil {
+			now = a.now()
+		}
+		snapshot := a.limiter.Snapshot(now)
+		if a.persister != nil {
+			snapshot.PersistencePending, snapshot.PersistenceError = a.persister.Status()
+		}
+		s.Limiter = &snapshot
 	}
 	return s
 }
@@ -190,6 +257,47 @@ func (a *app) port(w http.ResponseWriter, r *http.Request) {
 	if err := a.controller.SetEnabled(r.Context(), *req.Enabled); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
+	}
+	if a.limiter != nil {
+		a.limiter.ManualOverride()
+	}
+	if a.persister != nil {
+		a.persister.Request(false)
+	}
+	writeJSON(w, http.StatusOK, a.readStatus(r.Context()))
+}
+func (a *app) limiterSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if a.limiter == nil {
+		http.Error(w, "limiter is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Enabled         *bool `json:"enabled"`
+		MaxWatchMinutes *int  `json:"max_watch_minutes"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Enabled == nil || req.MaxWatchMinutes == nil {
+		http.Error(w, "enabled and max_watch_minutes are required", http.StatusBadRequest)
+		return
+	}
+	if *req.MaxWatchMinutes < 1 || *req.MaxWatchMinutes > 24*60 {
+		http.Error(w, "max_watch_minutes must be between 1 and 1440", http.StatusBadRequest)
+		return
+	}
+	if err := a.limiter.UpdateSettings(
+		r.Context(),
+		*req.Enabled,
+		time.Duration(*req.MaxWatchMinutes)*time.Minute,
+		a.controller.SetEnabled,
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if a.persister != nil {
+		a.persister.Request(false)
 	}
 	writeJSON(w, http.StatusOK, a.readStatus(r.Context()))
 }
@@ -219,15 +327,48 @@ func main() {
 	iface := getenv("IPTV_CONTROL_INTERFACE", "eth1")
 	ip := getenv("IPTV_CONTROL_IP", "/bin/ip")
 	controller := newIPController(iface, ip, realControl)
+	controller.dbusSend = getenv("IPTV_CONTROL_DBUS_SEND", "/usr/bin/dbus-send")
 	if realControl {
 		if _, err := controller.Status(context.Background()); err != nil {
 			log.Printf("warning: initial interface check failed: %v", err)
 		}
 	}
-	a := &app{controller: controller}
+	limiterConfig, err := limiterConfigFromEnv()
+	if err != nil {
+		log.Fatalf("invalid limiter configuration: %v", err)
+	}
+	limiter := newLimiterRunner(limiterConfig, controller)
+	var persister *statePersister
+	statePath := os.Getenv("IPTV_CONTROL_STATE_FILE")
+	if statePath != "" {
+		store := newStateStore(statePath)
+		persister = newStatePersister(store, limiter.machine)
+		loaded, loadErr := store.Load()
+		switch {
+		case loadErr == nil:
+			if loaded.WatchLimitSeconds > 24*60*60 {
+				log.Printf("warning: persisted watch limit is too large; ignoring state")
+			} else if err := limiter.machine.Restore(loaded); err != nil {
+				log.Printf("warning: restore limiter state failed: %v", err)
+			} else {
+				persister.SetLoaded(loaded)
+				if realControl && (loaded.Phase == string(LimiterInterventionUp) ||
+					loaded.Phase == string(LimiterInterventionDown)) {
+					if err := controller.SetEnabled(context.Background(), true); err != nil {
+						log.Printf("warning: restore LAN2 up after intervention failed: %v", err)
+					}
+				}
+			}
+		case !errors.Is(loadErr, os.ErrNotExist):
+			log.Printf("warning: load limiter state failed: %v", loadErr)
+		}
+		limiter.persister = persister
+	}
+	a := &app{controller: controller, limiter: limiter.machine, persister: persister, now: time.Now}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/status", a.status)
 	mux.HandleFunc("/api/v1/port", a.port)
+	mux.HandleFunc("/api/v1/limiter", a.limiterSettings)
 	mux.HandleFunc("/healthz", a.health)
 	staticFS, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -238,10 +379,22 @@ func main() {
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	limiterDone := make(chan struct{})
+	go func() {
+		defer close(limiterDone)
+		limiter.Run(ctx)
+	}()
 	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
-	log.Printf("iptv-control listening on %s interface=%s real=%v", addr, iface, realControl)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	log.Printf("iptv-control listening on %s interface=%s real=%v limiter=%v", addr, iface, realControl, limiterConfig.Enabled)
+	serveErr := srv.ListenAndServe()
+	stop()
+	select {
+	case <-limiterDone:
+	case <-time.After(6 * time.Second):
+		log.Printf("warning: limiter shutdown timed out")
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		log.Fatal(serveErr)
 	}
 }
 func getenv(k, fallback string) string {

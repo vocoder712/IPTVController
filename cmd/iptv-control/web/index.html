@@ -1,1 +1,162 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IPTV LAN2 控制</title><style>body{font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f4f5f7;color:#17202a}main{background:#fff;padding:24px;border:1px solid #d9dde3;border-radius:8px}button{width:100%;padding:18px;margin:8px 0;border:0;border-radius:6px;font-size:1.1rem}#on{background:#18794e;color:#fff}#off{background:#b42318;color:#fff}dd{margin:0 0 12px 0;color:#475467}dt{font-weight:650}</style><main><h1>LAN2 IPTV 开关</h1><button id="on">开启 LAN2</button><button id="off">关闭 LAN2</button><dl><dt>控制状态</dt><dd id="enabled">读取中...</dd><dt>接口状态</dt><dd id="detail">读取中...</dd><dt>提示</dt><dd>当前版本仅验证接口级控制，未包含定时任务。</dd></dl></main><script>const $=id=>document.getElementById(id);async function refresh(){const r=await fetch('/api/v1/status');const s=await r.json();$('enabled').textContent=s.enabled?'开启':'关闭';$('detail').textContent=`${s.interface} / 管理${s.admin_up?'UP':'DOWN'} / operstate=${s.oper_state||'-'} / carrier=${s.carrier||'-'}`;}async function setPort(enabled){$('enabled').textContent='操作中...';await fetch('/api/v1/port',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});await refresh();}$('on').onclick=()=>setPort(true);$('off').onclick=()=>setPort(false);refresh();setInterval(refresh,5000);</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IPTV LAN2 控制</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px;background:#f4f5f7;color:#17202a}
+  main{background:#fff;padding:24px;border:1px solid #d9dde3;border-radius:10px}
+  section{padding:18px 0;border-top:1px solid #e4e7ec}
+  button{width:100%;padding:15px;margin:7px 0;border:0;border-radius:7px;font-size:1rem;cursor:pointer}
+  button:disabled{cursor:wait;opacity:.65}
+  #on{background:#18794e;color:#fff}
+  #off{background:#b42318;color:#fff}
+  #save-limiter{background:#175cd3;color:#fff}
+  label{display:block;margin:12px 0 6px;font-weight:650}
+  label.switch{display:flex;gap:10px;align-items:center}
+  input[type=checkbox]{width:20px;height:20px}
+  input[type=number]{box-sizing:border-box;width:100%;padding:12px;border:1px solid #98a2b3;border-radius:6px;font-size:1rem}
+  dd{margin:0 0 12px;color:#475467}
+  dt{font-weight:650}
+  .hint{color:#667085;font-size:.9rem}
+  #message{min-height:1.4em;color:#b42318}
+</style>
+<main>
+  <h1>LAN2 IPTV 控制</h1>
+
+  <section>
+    <h2>手动开关</h2>
+    <button id="on">开启 LAN2</button>
+    <button id="off">关闭 LAN2</button>
+  </section>
+
+  <section>
+    <h2>智能限时</h2>
+    <label class="switch">
+      <input id="limiter-enabled" type="checkbox">
+      启用智能限时
+    </label>
+    <label for="max-watch-minutes">单次最长看电视时间（分钟）</label>
+    <input id="max-watch-minutes" type="number" min="1" max="1440" step="1" value="20">
+    <p class="hint">达到限时后，LAN2 将循环接通 54 秒、断开 6 秒。保存设置会重新开始本次计时。</p>
+    <button id="save-limiter">保存智能限时设置</button>
+    <p id="message"></p>
+  </section>
+
+  <section>
+    <h2>运行状态</h2>
+    <dl>
+      <dt>控制状态</dt><dd id="enabled">读取中...</dd>
+      <dt>接口状态</dt><dd id="detail">读取中...</dd>
+      <dt>限时状态</dt><dd id="limiter-state">读取中...</dd>
+    </dl>
+  </section>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const stateNames = {
+    idle: '未观看',
+    watching: '正在计时',
+    intervention_up: '限时干预（接通阶段）',
+    intervention_down: '限时干预（断开阶段）'
+  };
+  let settingsDirty = false;
+  let settingsLoaded = false;
+
+  $('limiter-enabled').addEventListener('change', () => settingsDirty = true);
+  $('max-watch-minutes').addEventListener('input', () => settingsDirty = true);
+
+  async function request(url, options) {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    if (!response.ok) throw new Error(text.trim() || `HTTP ${response.status}`);
+    return text ? JSON.parse(text) : {};
+  }
+
+  function render(status) {
+    $('enabled').textContent = status.enabled ? '开启' : '关闭';
+    $('detail').textContent =
+      `${status.interface} / 管理${status.admin_up ? 'UP' : 'DOWN'} / ` +
+      `operstate=${status.oper_state || '-'} / carrier=${status.carrier || '-'} ` +
+      `(${status.carrier_source || '-'})`;
+
+    const limiter = status.limiter;
+    if (!limiter) {
+      $('limiter-state').textContent = '不可用';
+      return;
+    }
+    const watchedMinutes = Math.floor((limiter.watched_duration || 0) / 60000000000);
+    let limiterText = limiter.enabled
+      ? `${stateNames[limiter.state] || limiter.state} / 已观看约 ${watchedMinutes} 分钟`
+      : '未启用';
+    if (limiter.persistence_pending) limiterText += ' / 配置待持久化';
+    if (limiter.persistence_error) limiterText += ` / 持久化失败：${limiter.persistence_error}`;
+    $('limiter-state').textContent = limiterText;
+    if (!settingsLoaded || !settingsDirty) {
+      $('limiter-enabled').checked = limiter.enabled;
+      $('max-watch-minutes').value = limiter.watch_limit_minutes;
+      settingsLoaded = true;
+      settingsDirty = false;
+    }
+  }
+
+  async function refresh() {
+    try {
+      render(await request('/api/v1/status'));
+    } catch (error) {
+      $('message').textContent = `状态读取失败：${error.message}`;
+    }
+  }
+
+  async function setPort(enabled) {
+    $('message').textContent = '操作中...';
+    try {
+      const status = await request('/api/v1/port', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled})
+      });
+      settingsDirty = false;
+      render(status);
+      $('message').textContent = '';
+    } catch (error) {
+      $('message').textContent = `操作失败：${error.message}`;
+    }
+  }
+
+  async function saveLimiter() {
+    const minutes = Number($('max-watch-minutes').value);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+      $('message').textContent = '最长观看时间必须是 1 到 1440 之间的整数分钟。';
+      return;
+    }
+    $('save-limiter').disabled = true;
+    $('message').textContent = '正在保存...';
+    try {
+      const status = await request('/api/v1/limiter', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          enabled: $('limiter-enabled').checked,
+          max_watch_minutes: minutes
+        })
+      });
+      settingsDirty = false;
+      render(status);
+      $('message').textContent = status.limiter && status.limiter.persistence_pending
+        ? '设置已生效，正在持久化。'
+        : '设置已生效并已持久化。';
+    } catch (error) {
+      $('message').textContent = `保存失败：${error.message}`;
+    } finally {
+      $('save-limiter').disabled = false;
+    }
+  }
+
+  $('on').onclick = () => setPort(true);
+  $('off').onclick = () => setPort(false);
+  $('save-limiter').onclick = saveLimiter;
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</html>
