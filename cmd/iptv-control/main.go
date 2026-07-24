@@ -318,6 +318,48 @@ func (a *app) nowTime() time.Time {
 	}
 	return time.Now()
 }
+
+func restorePortAfterLoad(
+	ctx context.Context,
+	realControl bool,
+	loadedPhase string,
+	restoredState LimiterState,
+	setEnabled func(context.Context, bool) error,
+) error {
+	if !realControl {
+		return nil
+	}
+	switch {
+	case restoredState == LimiterCooldown:
+		return setEnabled(ctx, false)
+	case loadedPhase == string(LimiterCooldown):
+		return setEnabled(ctx, true)
+	case restoredState == LimiterInterventionUp:
+		return setEnabled(ctx, true)
+	default:
+		return nil
+	}
+}
+
+func (a *app) intervene(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if a.limiter == nil {
+		http.Error(w, "limiter is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := a.limiter.StartIntervention(a.nowTime()); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if a.persister != nil {
+		a.persister.Request(true)
+	}
+	writeJSON(w, http.StatusOK, a.readStatus(r.Context()))
+}
+
 func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -365,15 +407,19 @@ func main() {
 		case loadErr == nil:
 			if loaded.WatchLimitSeconds > 24*60*60 {
 				log.Printf("warning: persisted watch limit is too large; ignoring state")
-			} else if err := limiter.machine.Restore(loaded); err != nil {
+			} else if err := limiter.machine.Restore(loaded, time.Now()); err != nil {
 				log.Printf("warning: restore limiter state failed: %v", err)
 			} else {
 				persister.SetLoaded(loaded)
-				if realControl && (loaded.Phase == string(LimiterInterventionUp) ||
-					loaded.Phase == string(LimiterInterventionDown)) {
-					if err := controller.SetEnabled(context.Background(), true); err != nil {
-						log.Printf("warning: restore LAN2 up after intervention failed: %v", err)
-					}
+				restoredState := limiter.machine.Snapshot(time.Now()).State
+				if err := restorePortAfterLoad(
+					context.Background(),
+					realControl,
+					loaded.Phase,
+					restoredState,
+					controller.SetEnabled,
+				); err != nil {
+					log.Printf("warning: reconcile LAN2 after limiter restore failed: %v", err)
 				}
 			}
 		case !errors.Is(loadErr, os.ErrNotExist):
@@ -386,6 +432,7 @@ func main() {
 	mux.HandleFunc("/api/v1/status", a.status)
 	mux.HandleFunc("/api/v1/port", a.port)
 	mux.HandleFunc("/api/v1/limiter", a.limiterSettings)
+	mux.HandleFunc("/api/v1/intervene", a.intervene)
 	mux.HandleFunc("/healthz", a.health)
 	staticFS, err := fs.Sub(webFS, "web")
 	if err != nil {

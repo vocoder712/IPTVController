@@ -135,6 +135,30 @@ func TestUpdateLimiterSettings(t *testing.T) {
 	}
 }
 
+func TestUpdateLimiterSettingsPreservesActiveSession(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	f := &fakeController{status: watchingStatus()}
+	cfg := defaultLimiterConfig()
+	cfg.Enabled = true
+	machine := newLimiterMachine(cfg)
+	machine.Step(context.Background(), now, watchingStatus(), f.SetEnabled)
+	a := &app{controller: f, limiter: machine, now: func() time.Time { return now.Add(5 * time.Minute) }}
+	rr := httptest.NewRecorder()
+	a.limiterSettings(rr, httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/limiter",
+		strings.NewReader(`{"enabled":true,"max_watch_minutes":35,"block_seconds":14}`),
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	snapshot := machine.Snapshot(now.Add(5 * time.Minute))
+	if snapshot.State != LimiterWatching || snapshot.WatchedDuration != 5*time.Minute ||
+		snapshot.WatchLimitMinutes != 35 || snapshot.BlockSeconds != 14 {
+		t.Fatalf("active session was reset: %+v", snapshot)
+	}
+}
+
 func TestUpdateLimiterSettingsKeepsBlockSecondsForOldClient(t *testing.T) {
 	f := &fakeController{}
 	machine := newLimiterMachine(defaultLimiterConfig())
@@ -178,6 +202,117 @@ func TestUpdateLimiterSettingsRejectsInvalidBlockSeconds(t *testing.T) {
 	}
 }
 
+func TestManualInterventionEndpoint(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	f := &fakeController{status: watchingStatus()}
+	cfg := defaultLimiterConfig()
+	cfg.Enabled = true
+	machine := newLimiterMachine(cfg)
+	machine.Step(context.Background(), now, watchingStatus(), f.SetEnabled)
+	a := &app{controller: f, limiter: machine, now: func() time.Time { return now.Add(time.Minute) }}
+
+	rr := httptest.NewRecorder()
+	a.intervene(rr, httptest.NewRequest(http.MethodPost, "/api/v1/intervene", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	snapshot := machine.Snapshot(now.Add(time.Minute))
+	if snapshot.State != LimiterInterventionUp || snapshot.WatchedDuration != time.Minute {
+		t.Fatalf("unexpected intervention: %+v", snapshot)
+	}
+
+	rr = httptest.NewRecorder()
+	a.intervene(rr, httptest.NewRequest(http.MethodPost, "/api/v1/intervene", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("repeated status=%d, want conflict", rr.Code)
+	}
+}
+
+func TestManualInterventionEndpointRejectsIdleAndGet(t *testing.T) {
+	cfg := defaultLimiterConfig()
+	cfg.Enabled = true
+	a := &app{controller: &fakeController{}, limiter: newLimiterMachine(cfg)}
+
+	rr := httptest.NewRecorder()
+	a.intervene(rr, httptest.NewRequest(http.MethodPost, "/api/v1/intervene", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("idle status=%d, want conflict", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	a.intervene(rr, httptest.NewRequest(http.MethodGet, "/api/v1/intervene", nil))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status=%d", rr.Code)
+	}
+}
+
+func TestRestorePortAfterLoad(t *testing.T) {
+	tests := []struct {
+		name          string
+		real          bool
+		loadedPhase   string
+		restoredState LimiterState
+		wantAction    *bool
+	}{
+		{
+			name:          "continue cooldown down",
+			real:          true,
+			loadedPhase:   string(LimiterCooldown),
+			restoredState: LimiterCooldown,
+			wantAction:    boolPointer(false),
+		},
+		{
+			name:          "release expired cooldown",
+			real:          true,
+			loadedPhase:   string(LimiterCooldown),
+			restoredState: LimiterIdle,
+			wantAction:    boolPointer(true),
+		},
+		{
+			name:          "restore intervention up",
+			real:          true,
+			loadedPhase:   string(LimiterInterventionDown),
+			restoredState: LimiterInterventionUp,
+			wantAction:    boolPointer(true),
+		},
+		{
+			name:          "ordinary idle no action",
+			real:          true,
+			loadedPhase:   string(LimiterIdle),
+			restoredState: LimiterIdle,
+		},
+		{
+			name:          "simulation no action",
+			loadedPhase:   string(LimiterCooldown),
+			restoredState: LimiterCooldown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var actions []bool
+			err := restorePortAfterLoad(
+				context.Background(),
+				tt.real,
+				tt.loadedPhase,
+				tt.restoredState,
+				func(_ context.Context, enabled bool) error {
+					actions = append(actions, enabled)
+					return nil
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantAction == nil {
+				if len(actions) != 0 {
+					t.Fatalf("unexpected actions: %v", actions)
+				}
+			} else if len(actions) != 1 || actions[0] != *tt.wantAction {
+				t.Fatalf("actions=%v, want %v", actions, *tt.wantAction)
+			}
+		})
+	}
+}
+
 func TestEmbeddedPageContainsLimiterControls(t *testing.T) {
 	page, err := webFS.ReadFile("web/index.html")
 	if err != nil {
@@ -189,7 +324,10 @@ func TestEmbeddedPageContainsLimiterControls(t *testing.T) {
 		`id="max-watch-minutes"`,
 		`id="block-seconds"`,
 		`id="save-limiter"`,
+		`id="intervene-now"`,
 		`/api/v1/limiter`,
+		`/api/v1/intervene`,
+		`cooldown: '冷却锁定`,
 		`min="1" max="25"`,
 	} {
 		if !strings.Contains(html, required) {
@@ -434,4 +572,8 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }

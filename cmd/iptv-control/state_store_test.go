@@ -132,7 +132,7 @@ func TestLimiterRestoresAccumulatedWatchingTime(t *testing.T) {
 		DownDurationSeconds: 17,
 		AccumulatedSeconds:  10 * 60,
 		Phase:               string(LimiterWatching),
-	}); err != nil {
+	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
@@ -157,7 +157,7 @@ func TestLimiterRestoresLegacyStateWithDefaultBlockDuration(t *testing.T) {
 		Enabled:           true,
 		WatchLimitSeconds: 20 * 60,
 		Phase:             string(LimiterIdle),
-	}); err != nil {
+	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if got := m.Snapshot(time.Now()).BlockSeconds; got != 6 {
@@ -171,7 +171,7 @@ func TestLimiterRejectsInvalidPersistedBlockDuration(t *testing.T) {
 		Enabled:             true,
 		WatchLimitSeconds:   20 * 60,
 		DownDurationSeconds: 26,
-	}); err == nil {
+	}, time.Now()); err == nil {
 		t.Fatal("expected invalid persisted block duration")
 	}
 }
@@ -183,7 +183,7 @@ func TestLimiterRestoresInterventionAsUpOnly(t *testing.T) {
 		WatchLimitSeconds:  20 * 60,
 		AccumulatedSeconds: 20 * 60,
 		Phase:              string(LimiterInterventionDown),
-	}); err != nil {
+	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
@@ -201,23 +201,99 @@ func TestLimiterRestoresInterventionAsUpOnly(t *testing.T) {
 	}
 }
 
-func TestRestoredProgressClearsWhenCarrierIsOff(t *testing.T) {
+func TestRestoredProgressEntersCooldownWhenCarrierIsOff(t *testing.T) {
 	m := newLimiterMachine(testLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
 		Enabled:            true,
 		WatchLimitSeconds:  20 * 60,
 		AccumulatedSeconds: 10 * 60,
 		Phase:              string(LimiterWatching),
-	}); err != nil {
+	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	m.Step(context.Background(), now, PortStatus{AdminUp: true, Carrier: "0"}, func(context.Context, bool) error {
+	var actions []bool
+	m.Step(context.Background(), now, PortStatus{AdminUp: true, Carrier: "0"}, func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
 		return nil
 	})
 	snapshot := m.Snapshot(now)
+	if snapshot.State != LimiterCooldown || snapshot.WatchedDuration != 10*time.Minute ||
+		len(actions) != 1 || actions[0] {
+		t.Fatalf("restored progress did not enter cooldown: snapshot=%+v actions=%v", snapshot, actions)
+	}
+}
+
+func TestLimiterRestoresUnexpiredCooldown(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	until := now.Add(17 * time.Minute)
+	m := newLimiterMachine(testLimiterConfig())
+	if err := m.Restore(persistedLimiterState{
+		Enabled:            true,
+		WatchLimitSeconds:  20 * 60,
+		AccumulatedSeconds: 8 * 60,
+		Phase:              string(LimiterCooldown),
+		CooldownUntil:      until.Format(time.RFC3339Nano),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := m.Snapshot(now)
+	if snapshot.State != LimiterCooldown || snapshot.WatchedDuration != 8*time.Minute ||
+		!snapshot.CooldownUntil.Equal(until) || !snapshot.NextAction.Equal(until) {
+		t.Fatalf("unexpected restored cooldown: %+v", snapshot)
+	}
+}
+
+func TestCooldownPersistentStateRoundTrip(t *testing.T) {
+	start := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	m := newLimiterMachine(testLimiterConfig())
+	m.Step(context.Background(), start, watchingStatus(), func(context.Context, bool) error { return nil })
+	stopped := start.Add(8 * time.Minute)
+	m.Step(
+		context.Background(),
+		stopped,
+		PortStatus{AdminUp: true, Carrier: "0"},
+		func(context.Context, bool) error { return nil },
+	)
+	state := m.PersistentState(stopped.Add(time.Minute))
+	if state.Phase != string(LimiterCooldown) || state.AccumulatedSeconds != 8*60 ||
+		state.CooldownUntil == "" {
+		t.Fatalf("unexpected persistent cooldown: %+v", state)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.log")
+	if err := newStateStore(path).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := newStateStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := newLimiterMachine(testLimiterConfig())
+	if err := restored.Restore(loaded, stopped.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := restored.Snapshot(stopped.Add(2 * time.Minute))
+	if snapshot.State != LimiterCooldown || snapshot.WatchedDuration != 8*time.Minute {
+		t.Fatalf("cooldown round trip failed: %+v", snapshot)
+	}
+}
+
+func TestLimiterDiscardsExpiredCooldown(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	m := newLimiterMachine(testLimiterConfig())
+	if err := m.Restore(persistedLimiterState{
+		Enabled:            true,
+		WatchLimitSeconds:  20 * 60,
+		AccumulatedSeconds: 8 * 60,
+		Phase:              string(LimiterCooldown),
+		CooldownUntil:      now.Add(-time.Second).Format(time.RFC3339Nano),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := m.Snapshot(now)
 	if snapshot.State != LimiterIdle || snapshot.WatchedDuration != 0 {
-		t.Fatalf("stale progress was not cleared: %+v", snapshot)
+		t.Fatalf("expired cooldown was restored: %+v", snapshot)
 	}
 }
 
@@ -265,6 +341,43 @@ func TestStatePersisterCoalescesWritesWithinMinimumGap(t *testing.T) {
 	}
 	if after.DownDurationSeconds != 18 {
 		t.Fatalf("block duration was not persisted: %+v", after)
+	}
+}
+
+func TestEnteringCooldownForcesPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.log")
+	store := newStateStore(path)
+	cfg := testLimiterConfig()
+	controller := &runnerFakeController{
+		status: PortStatus{Interface: "eth1", Enabled: true, AdminUp: true, Carrier: "1"},
+		calls:  make(chan bool, 2),
+	}
+	runner := newLimiterRunner(cfg, controller)
+	persister := newStatePersister(store, runner.machine)
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return now }
+	persister.now = func() time.Time { return now }
+	runner.persister = persister
+
+	persister.Request(false)
+	if err := persister.FlushDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runner.poll(context.Background())
+	controller.mu.Lock()
+	controller.status.Carrier = "0"
+	controller.mu.Unlock()
+	now = now.Add(time.Second)
+	runner.poll(context.Background())
+	if err := persister.FlushDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := newStateStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != string(LimiterCooldown) || loaded.CooldownUntil == "" {
+		t.Fatalf("cooldown was not force-persisted: %+v", loaded)
 	}
 }
 

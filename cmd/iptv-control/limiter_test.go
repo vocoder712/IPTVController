@@ -15,6 +15,7 @@ func testLimiterConfig() LimiterConfig {
 		WatchLimit:   20 * time.Minute,
 		Cycle:        time.Minute,
 		DownDuration: 6 * time.Second,
+		Cooldown:     30 * time.Minute,
 		ActionRetry:  time.Second,
 	}
 }
@@ -76,20 +77,149 @@ func TestLimiterStateTransitions(t *testing.T) {
 	}
 }
 
-func TestLimiterResetsWhenBoxTurnsOff(t *testing.T) {
+func TestLimiterEntersCooldownWhenBoxTurnsOffBeforeLimit(t *testing.T) {
 	cfg := testLimiterConfig()
 	m := newLimiterMachine(cfg)
 	start := time.Now()
-	set := func(context.Context, bool) error { return nil }
+	var actions []bool
+	set := func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
+		return nil
+	}
 
 	m.Step(context.Background(), start, watchingStatus(), set)
-	m.Step(context.Background(), start.Add(cfg.WatchLimit), watchingStatus(), set)
-	m.Step(context.Background(), start.Add(cfg.WatchLimit+time.Second), PortStatus{AdminUp: true, Carrier: "0"}, set)
+	turnedOff := start.Add(5 * time.Minute)
+	m.Step(context.Background(), turnedOff, PortStatus{AdminUp: true, Carrier: "0"}, set)
 
-	snapshot := assertLimiterState(t, m, start.Add(cfg.WatchLimit+time.Second), LimiterIdle)
-	if !snapshot.WatchingSince.IsZero() || !snapshot.NextAction.IsZero() {
-		t.Fatalf("idle state retained timers: %+v", snapshot)
+	snapshot := assertLimiterState(t, m, turnedOff, LimiterCooldown)
+	if snapshot.WatchedDuration != 5*time.Minute ||
+		!snapshot.CooldownUntil.Equal(turnedOff.Add(cfg.Cooldown)) ||
+		!snapshot.NextAction.Equal(snapshot.CooldownUntil) {
+		t.Fatalf("unexpected cooldown snapshot: %+v", snapshot)
 	}
+	if len(actions) != 1 || actions[0] {
+		t.Fatalf("actions=%v, want [false]", actions)
+	}
+
+	m.Step(
+		context.Background(),
+		snapshot.CooldownUntil.Add(-time.Second),
+		PortStatus{AdminUp: false, Carrier: "0"},
+		set,
+	)
+	assertLimiterState(t, m, snapshot.CooldownUntil.Add(-time.Second), LimiterCooldown)
+
+	m.Step(
+		context.Background(),
+		snapshot.CooldownUntil,
+		PortStatus{AdminUp: false, Carrier: "0"},
+		set,
+	)
+	snapshot = assertLimiterState(t, m, snapshot.CooldownUntil, LimiterIdle)
+	if snapshot.WatchedDuration != 0 || len(actions) != 2 || !actions[1] {
+		t.Fatalf("cooldown did not restore and clear: snapshot=%+v actions=%v", snapshot, actions)
+	}
+}
+
+func TestLimiterEntersCooldownWhenCablePulledDuringIntervention(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	var actions []bool
+	set := func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	m.Step(context.Background(), start.Add(cfg.WatchLimit), watchingStatus(), set)
+	pulled := start.Add(cfg.WatchLimit + time.Second)
+	m.Step(context.Background(), pulled, PortStatus{AdminUp: true, Carrier: "0"}, set)
+
+	snapshot := assertLimiterState(t, m, pulled, LimiterCooldown)
+	if len(actions) != 1 || actions[0] || snapshot.WatchedDuration < cfg.WatchLimit {
+		t.Fatalf("unexpected cooldown: snapshot=%+v actions=%v", snapshot, actions)
+	}
+}
+
+func TestCooldownForcesPortBackDown(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	var actions []bool
+	set := func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	m.Step(context.Background(), start.Add(time.Minute), PortStatus{AdminUp: true, Carrier: "0"}, set)
+	m.Step(context.Background(), start.Add(2*time.Minute), watchingStatus(), set)
+	if len(actions) != 2 || actions[0] || actions[1] {
+		t.Fatalf("cooldown did not force down: %v", actions)
+	}
+}
+
+func TestCooldownDownRetryKeepsOriginalDeadline(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	attempt := 0
+	set := func(_ context.Context, enabled bool) error {
+		if enabled {
+			t.Fatal("unexpected up")
+		}
+		attempt++
+		if attempt == 1 {
+			return errors.New("down failed")
+		}
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	stopped := start.Add(time.Minute)
+	m.Step(context.Background(), stopped, PortStatus{AdminUp: true, Carrier: "0"}, set)
+	failed := assertLimiterState(t, m, stopped, LimiterCooldown)
+	wantUntil := stopped.Add(cfg.Cooldown)
+	if !failed.CooldownUntil.Equal(wantUntil) ||
+		!failed.NextAction.Equal(stopped.Add(cfg.ActionRetry)) {
+		t.Fatalf("unexpected failed cooldown: %+v", failed)
+	}
+	m.Step(context.Background(), stopped.Add(cfg.ActionRetry), watchingStatus(), set)
+	retried := assertLimiterState(t, m, stopped.Add(cfg.ActionRetry), LimiterCooldown)
+	if !retried.CooldownUntil.Equal(wantUntil) || !retried.NextAction.Equal(wantUntil) {
+		t.Fatalf("retry extended cooldown: %+v", retried)
+	}
+}
+
+func TestCooldownUpRetryKeepsStateUntilSuccess(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	upAttempts := 0
+	set := func(_ context.Context, enabled bool) error {
+		if enabled {
+			upAttempts++
+			if upAttempts == 1 {
+				return errors.New("up failed")
+			}
+		}
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	stopped := start.Add(time.Minute)
+	m.Step(context.Background(), stopped, PortStatus{AdminUp: true, Carrier: "0"}, set)
+	until := stopped.Add(cfg.Cooldown)
+	m.Step(context.Background(), until, PortStatus{AdminUp: false, Carrier: "0"}, set)
+	failed := assertLimiterState(t, m, until, LimiterCooldown)
+	if !failed.CooldownUntil.Equal(until) ||
+		!failed.NextAction.Equal(until.Add(cfg.ActionRetry)) {
+		t.Fatalf("unexpected up retry: %+v", failed)
+	}
+	m.Step(
+		context.Background(),
+		until.Add(cfg.ActionRetry),
+		PortStatus{AdminUp: false, Carrier: "0"},
+		set,
+	)
+	assertLimiterState(t, m, until.Add(cfg.ActionRetry), LimiterIdle)
 }
 
 func TestLimiterDoesNotTreatAutomaticDownAsBoxOff(t *testing.T) {
@@ -187,6 +317,113 @@ func TestLimiterSettingsEnableAndChangeWatchLimit(t *testing.T) {
 	}
 }
 
+func TestChangingSettingsPreservesWatchingProgress(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	set := func(context.Context, bool) error {
+		t.Fatal("unexpected port action")
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	changed := start.Add(7 * time.Minute)
+	if err := m.UpdateSettings(context.Background(), true, 30*time.Minute, 15*time.Second, set); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := assertLimiterState(t, m, changed, LimiterWatching)
+	if snapshot.WatchedDuration != 7*time.Minute || snapshot.WatchLimitMinutes != 30 ||
+		snapshot.BlockSeconds != 15 {
+		t.Fatalf("settings reset progress: %+v", snapshot)
+	}
+}
+
+func TestChangingSettingsPreservesInterventionStateAndTimer(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	set := func(context.Context, bool) error { return nil }
+	m.Step(context.Background(), start, watchingStatus(), set)
+	reached := start.Add(cfg.WatchLimit)
+	m.Step(context.Background(), reached, watchingStatus(), set)
+	before := m.Snapshot(reached)
+
+	if err := m.UpdateSettings(context.Background(), true, 40*time.Minute, 20*time.Second, set); err != nil {
+		t.Fatal(err)
+	}
+	after := assertLimiterState(t, m, reached, LimiterInterventionUp)
+	if !after.NextAction.Equal(before.NextAction) || after.WatchedDuration != before.WatchedDuration ||
+		after.WatchLimitMinutes != 40 || after.BlockSeconds != 20 {
+		t.Fatalf("settings changed intervention state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestChangingSettingsPreservesInterventionDown(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	var actions []bool
+	set := func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
+		return nil
+	}
+	m.Step(context.Background(), start, watchingStatus(), set)
+	reached := start.Add(cfg.WatchLimit)
+	m.Step(context.Background(), reached, watchingStatus(), set)
+	downAt := reached.Add(cfg.upDuration())
+	m.Step(context.Background(), downAt, watchingStatus(), set)
+	before := assertLimiterState(t, m, downAt, LimiterInterventionDown)
+
+	if err := m.UpdateSettings(context.Background(), true, 40*time.Minute, 20*time.Second, set); err != nil {
+		t.Fatal(err)
+	}
+	after := assertLimiterState(t, m, downAt, LimiterInterventionDown)
+	if !after.NextAction.Equal(before.NextAction) || len(actions) != 1 || actions[0] {
+		t.Fatalf("settings exited down phase: before=%+v after=%+v actions=%v", before, after, actions)
+	}
+}
+
+func TestChangingSettingsPreservesCooldown(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	start := time.Now()
+	set := func(context.Context, bool) error { return nil }
+	m.Step(context.Background(), start, watchingStatus(), set)
+	stopped := start.Add(5 * time.Minute)
+	m.Step(context.Background(), stopped, PortStatus{AdminUp: true, Carrier: "0"}, set)
+	before := assertLimiterState(t, m, stopped, LimiterCooldown)
+
+	if err := m.UpdateSettings(context.Background(), true, 40*time.Minute, 20*time.Second, set); err != nil {
+		t.Fatal(err)
+	}
+	after := assertLimiterState(t, m, stopped, LimiterCooldown)
+	if !after.CooldownUntil.Equal(before.CooldownUntil) ||
+		!after.NextAction.Equal(before.NextAction) ||
+		after.WatchedDuration != before.WatchedDuration {
+		t.Fatalf("settings exited cooldown: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestManualInterventionOnlyWhileWatching(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	now := time.Now()
+	if err := m.StartIntervention(now); err == nil {
+		t.Fatal("expected idle intervention to fail")
+	}
+	m.Step(context.Background(), now, watchingStatus(), func(context.Context, bool) error { return nil })
+	if err := m.StartIntervention(now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := assertLimiterState(t, m, now.Add(time.Minute), LimiterInterventionUp)
+	if snapshot.WatchedDuration != time.Minute ||
+		!snapshot.NextAction.Equal(now.Add(time.Minute).Add(cfg.upDuration())) {
+		t.Fatalf("unexpected manual intervention: %+v", snapshot)
+	}
+	if err := m.StartIntervention(now.Add(2 * time.Minute)); err == nil {
+		t.Fatal("expected repeated intervention to fail")
+	}
+}
+
 func TestLimiterSettingsRejectInvalidBlockSeconds(t *testing.T) {
 	m := newLimiterMachine(defaultLimiterConfig())
 	for _, duration := range []time.Duration{0, 26 * time.Second, 1500 * time.Millisecond} {
@@ -228,18 +465,39 @@ func TestDisablingLimiterRestoresAutomaticDown(t *testing.T) {
 	}
 }
 
+func TestDisablingLimiterRestoresCooldownPort(t *testing.T) {
+	cfg := testLimiterConfig()
+	m := newLimiterMachine(cfg)
+	now := time.Now()
+	var actions []bool
+	set := func(_ context.Context, enabled bool) error {
+		actions = append(actions, enabled)
+		return nil
+	}
+	m.Step(context.Background(), now, watchingStatus(), set)
+	m.Step(context.Background(), now.Add(time.Minute), PortStatus{AdminUp: true, Carrier: "0"}, set)
+	if err := m.UpdateSettings(context.Background(), false, 30*time.Minute, 10*time.Second, set); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := assertLimiterState(t, m, now, LimiterIdle)
+	if snapshot.Enabled || len(actions) != 2 || actions[0] || !actions[1] {
+		t.Fatalf("cooldown disable did not restore: snapshot=%+v actions=%v", snapshot, actions)
+	}
+}
+
 func TestLimiterConfigFromEnv(t *testing.T) {
 	t.Setenv("IPTV_LIMITER_ENABLED", "1")
 	t.Setenv("IPTV_LIMITER_POLL_INTERVAL", "5s")
 	t.Setenv("IPTV_LIMITER_WATCH_LIMIT", "2m")
 	t.Setenv("IPTV_LIMITER_CYCLE", "10s")
 	t.Setenv("IPTV_LIMITER_DOWN_DURATION", "2s")
+	t.Setenv("IPTV_LIMITER_COOLDOWN_DURATION", "45m")
 	cfg, err := limiterConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.Enabled || cfg.PollInterval != 5*time.Second || cfg.WatchLimit != 2*time.Minute ||
-		cfg.Cycle != 10*time.Second || cfg.DownDuration != 2*time.Second {
+		cfg.Cycle != 10*time.Second || cfg.DownDuration != 2*time.Second || cfg.Cooldown != 45*time.Minute {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
@@ -249,6 +507,13 @@ func TestLimiterConfigRejectsInvalidDurations(t *testing.T) {
 	t.Setenv("IPTV_LIMITER_DOWN_DURATION", "3s")
 	if _, err := limiterConfigFromEnv(); err == nil {
 		t.Fatal("expected invalid duration error")
+	}
+}
+
+func TestLimiterConfigRejectsInvalidCooldown(t *testing.T) {
+	t.Setenv("IPTV_LIMITER_COOLDOWN_DURATION", "0s")
+	if _, err := limiterConfigFromEnv(); err == nil {
+		t.Fatal("expected invalid cooldown error")
 	}
 }
 

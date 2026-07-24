@@ -361,6 +361,91 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 ---
 
+任务（2026-07-24）：修复儿童通过短暂拔网线绕过智能限时；增加 30 分钟
+冷却锁定、观看期间家长手动进入干预，以及修改观看/阻断参数不清空当前状态。
+本地逻辑验证通过后直接部署光猫。
+
+状态：进行中。
+
+确认的状态机语义：
+
+- 新增 `cooldown`，固定持续 30 分钟并保持 LAN2 管理 down；到期后自动 up，
+  清空累计观看时间并回到 `idle`。
+- 已进入 `watching` 后，只要接口仍由自动逻辑管理且 DBus 载波变 0，即使尚未
+  达到最大观看时间，也保留累计时间并立即进入 cooldown；这覆盖儿童关机或
+  拔线逃避计时。
+- `intervention_up` 中载波变 0 不再回 idle，而是进入 cooldown。
+  `intervention_down` 因自动 down 无法判断物理拔线；恢复 up 后下一次有效
+  采样若仍为 0，再进入 cooldown。
+- cooldown 状态和到期时间写入持久日志；重启后若未到期必须重新 down LAN2，
+  不能通过重启绕过。
+- 新增“立即干预”操作，仅当状态为 `watching` 时服务端允许，进入
+  `intervention_up`；H5 按状态启用按钮。
+- 智能限时已启用时修改最大观看时间或阻断秒数，只更新参数，保留累计时间、
+  当前状态和动作定时器；真正停用时才恢复自动 down/cooldown 中的端口并重置。
+- 现有家长手动 LAN2 开关继续作为显式覆盖，保持此前确认的语义。
+
+本地实现进展：
+
+- 新增 `LimiterCooldown`、固定 30 分钟 cooldown、截止时间持久化和启动恢复
+  端口协调；冷却期间 down/up 失败按短间隔重试但不延长原截止时间。
+- watching 或 intervention_up 检测到载波消失时，保留累计时间并立即 down；
+  cooldown 到期成功 up 后才清空并回 idle。
+- 新增 `POST /api/v1/intervene` 和 H5“立即进入干预”按钮，仅 watching 可用。
+- 已启用状态下修改最大观看时长/阻断时长会保留 watching、
+  intervention_up、intervention_down 和 cooldown 的状态、累计时间及当前
+  动作截止时间；停用才恢复并重置。
+- 旧持久记录继续兼容；cooldown 的到期时间新增为尾部 `omitempty` 字段，
+  不破坏旧 JSON/CRC。
+- 专项测试覆盖提前关机、干预拔线、冷却强制 down、down/up 重试、30 分钟
+  到期、冷却跨重启/过期释放、强制持久化、手动干预权限、各活动状态无损
+  参数修改和启动端口协调。
+- 本地验证通过：`go test ./...`、`go test -race ./...`、`go vet ./...`、
+  `git diff --check` 和 GOARM=5 交叉构建。
+- 待部署二进制 SHA-256：
+  `775a04194f073928b43038fd7bdf2fb31fb4d257aff5989ecd8ad20b1e001221`。
+
+完成结果（2026-07-24）：
+
+- 状态机最终实现：
+  - watching 中载波消失，无论是否达到观看上限，都保留累计时间并立即 down，
+    进入固定 30 分钟 cooldown；
+  - intervention_up 中拔线同样进入 cooldown；intervention_down 忽略自动
+    down 造成的载波 0，恢复后再根据有效采样判断；
+  - cooldown 未到期时强制保持 down；到期 up 成功后才清空累计并回 idle；
+  - down/up 失败使用动作重试时间，但 `cooldown_until` 始终保持原截止点。
+- cooldown 的 phase、累计时间和 UTC 截止时间写入带 CRC 的状态日志；服务
+  停止前强制刷新。重启恢复未到期 cooldown 时显式 down，已过期时显式 up。
+- 新增 `POST /api/v1/intervene`，只允许 watching；H5 按状态启用“立即进入
+  干预”按钮，并显示 cooldown 预计剩余分钟。
+- enabled 保持 true 时修改最大观看时间或阻断秒数只更新配置，保留
+  watching/intervention_up/intervention_down/cooldown 的累计、状态和当前
+  定时；停用才恢复端口并重置。
+- 本地专项及全量验证通过：
+  - `go test ./...`
+  - `go test -race ./...`
+  - `go vet ./...`
+  - `git diff --check`
+  - GOARM=5 交叉构建
+- 新二进制上传后设备端 SHA-256 匹配，持久文件原子替换，并严格通过
+  `sync; reboot` 由容器开机脚本启动；未用 Telnet 启动替代进程。
+- 重启验收：
+  - 8088、H5 和 DBus 状态源正常；
+  - H5 包含新按钮，`/api/v1/intervene` 已注册；
+  - 原配置完整恢复为 enabled、20 分钟、阻断 15 秒；
+  - 机顶盒关闭时 `admin_up=true`、`carrier=0`、state=idle；
+  - idle 状态 POST 手动干预返回 HTTP 409，状态和端口不变；
+  - 容器进程 PID 2682，`/proc/2682/exe` 与容器持久二进制哈希均为
+    `775a04194f073928b43038fd7bdf2fb31fb4d257aff5989ecd8ad20b1e001221`。
+- 部署时临时创建的旧版回滚副本已在验收成功后删除；设备目录只保留当前
+  `iptv-control`，apps 分区仍为 55% 使用、20.8 MiB 可用。
+- 按用户要求，本轮 cooldown 的完整 30 分钟行为只做本地加速逻辑测试；
+  设备端仅做启动、兼容配置、API 权限和无副作用状态验收。
+
+状态：已完成。
+
+---
+
 任务（2026-07-24）：下一版允许家长设置智能干预每分钟的阻断时长，范围
 1–25 秒；本地验证通过后直接上传光猫并重启。
 

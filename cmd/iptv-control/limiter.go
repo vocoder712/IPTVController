@@ -15,6 +15,7 @@ const (
 	LimiterWatching         LimiterState = "watching"
 	LimiterInterventionUp   LimiterState = "intervention_up"
 	LimiterInterventionDown LimiterState = "intervention_down"
+	LimiterCooldown         LimiterState = "cooldown"
 
 	minBlockSeconds = 1
 	maxBlockSeconds = 25
@@ -26,6 +27,7 @@ type LimiterConfig struct {
 	WatchLimit   time.Duration
 	Cycle        time.Duration
 	DownDuration time.Duration
+	Cooldown     time.Duration
 	ActionRetry  time.Duration
 }
 
@@ -35,6 +37,7 @@ func defaultLimiterConfig() LimiterConfig {
 		WatchLimit:   20 * time.Minute,
 		Cycle:        time.Minute,
 		DownDuration: 6 * time.Second,
+		Cooldown:     30 * time.Minute,
 		ActionRetry:  time.Second,
 	}
 }
@@ -53,6 +56,9 @@ func limiterConfigFromEnv() (LimiterConfig, error) {
 		return cfg, err
 	}
 	if cfg.DownDuration, err = durationEnv("IPTV_LIMITER_DOWN_DURATION", cfg.DownDuration); err != nil {
+		return cfg, err
+	}
+	if cfg.Cooldown, err = durationEnv("IPTV_LIMITER_COOLDOWN_DURATION", cfg.Cooldown); err != nil {
 		return cfg, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -89,6 +95,8 @@ func (c LimiterConfig) Validate() error {
 		return fmt.Errorf("down duration must be between %d and %d seconds", minBlockSeconds, maxBlockSeconds)
 	case c.DownDuration >= c.Cycle:
 		return fmt.Errorf("down duration must be shorter than cycle")
+	case c.Cooldown <= 0:
+		return fmt.Errorf("cooldown duration must be positive")
 	case c.ActionRetry <= 0:
 		return fmt.Errorf("action retry must be positive")
 	default:
@@ -108,6 +116,7 @@ type LimiterSnapshot struct {
 	WatchingSince      time.Time     `json:"watching_since,omitempty"`
 	WatchedDuration    time.Duration `json:"watched_duration"`
 	NextAction         time.Time     `json:"next_action,omitempty"`
+	CooldownUntil      time.Time     `json:"cooldown_until,omitempty"`
 	LastError          string        `json:"last_error,omitempty"`
 	PersistencePending bool          `json:"persistence_pending,omitempty"`
 	PersistenceError   string        `json:"persistence_error,omitempty"`
@@ -120,6 +129,7 @@ type limiterMachine struct {
 	watchingSince time.Time
 	watchedBefore time.Duration
 	nextAction    time.Time
+	cooldownUntil time.Time
 	lastError     string
 }
 
@@ -144,7 +154,7 @@ func (m *limiterMachine) Step(ctx context.Context, now time.Time, status PortSta
 		}
 	case LimiterWatching:
 		if !isWatching(status) {
-			m.resetLocked()
+			m.enterCooldownLocked(ctx, now, setEnabled)
 			return
 		}
 		if m.watchingSince.IsZero() {
@@ -158,8 +168,8 @@ func (m *limiterMachine) Step(ctx context.Context, now time.Time, status PortSta
 		}
 	case LimiterInterventionUp:
 		// carrier=0 is meaningful only while the interface is administratively up.
-		if status.AdminUp && status.Carrier == "0" {
-			m.resetLocked()
+		if !isWatching(status) {
+			m.enterCooldownLocked(ctx, now, setEnabled)
 			return
 		}
 		if m.nextAction.IsZero() {
@@ -190,9 +200,55 @@ func (m *limiterMachine) Step(ctx context.Context, now time.Time, status PortSta
 			m.state = LimiterInterventionUp
 			m.nextAction = now.Add(m.config.upDuration())
 		}
+	case LimiterCooldown:
+		if m.cooldownUntil.IsZero() {
+			m.cooldownUntil = now.Add(m.config.Cooldown)
+		}
+		if !now.Before(m.cooldownUntil) {
+			if err := setEnabled(ctx, true); err != nil {
+				m.lastError = err.Error()
+				m.nextAction = now.Add(m.config.ActionRetry)
+				return
+			}
+			m.resetLocked()
+			return
+		}
+		if status.AdminUp {
+			if err := setEnabled(ctx, false); err != nil {
+				m.lastError = err.Error()
+				m.nextAction = now.Add(m.config.ActionRetry)
+				return
+			}
+			m.lastError = ""
+		}
+		m.nextAction = m.cooldownUntil
 	default:
 		m.resetLocked()
 	}
+}
+
+func (m *limiterMachine) freezeWatchedLocked(now time.Time) {
+	m.watchedBefore = m.watchedDurationLocked(now)
+	m.watchingSince = time.Time{}
+}
+
+func (m *limiterMachine) enterCooldownLocked(
+	ctx context.Context,
+	now time.Time,
+	setEnabled func(context.Context, bool) error,
+) {
+	if m.state == LimiterWatching {
+		m.freezeWatchedLocked(now)
+	}
+	m.state = LimiterCooldown
+	m.cooldownUntil = now.Add(m.config.Cooldown)
+	if err := setEnabled(ctx, false); err != nil {
+		m.lastError = err.Error()
+		m.nextAction = now.Add(m.config.ActionRetry)
+		return
+	}
+	m.lastError = ""
+	m.nextAction = m.cooldownUntil
 }
 
 func (m *limiterMachine) Stop(ctx context.Context, setEnabled func(context.Context, bool) error) error {
@@ -223,7 +279,13 @@ func (m *limiterMachine) UpdateSettings(
 	if err := validateBlockDuration(downDuration, m.config.Cycle); err != nil {
 		return err
 	}
-	if m.state == LimiterInterventionDown {
+	wasEnabled := m.config.Enabled
+	if wasEnabled && enabled {
+		m.config.WatchLimit = watchLimit
+		m.config.DownDuration = downDuration
+		return nil
+	}
+	if !enabled && (m.state == LimiterInterventionDown || m.state == LimiterCooldown) {
 		if err := setEnabled(ctx, true); err != nil {
 			m.lastError = err.Error()
 			return fmt.Errorf("restore port before updating limiter: %w", err)
@@ -233,6 +295,22 @@ func (m *limiterMachine) UpdateSettings(
 	m.config.WatchLimit = watchLimit
 	m.config.DownDuration = downDuration
 	m.resetLocked()
+	return nil
+}
+
+func (m *limiterMachine) StartIntervention(now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.config.Enabled {
+		return fmt.Errorf("limiter is disabled")
+	}
+	if m.state != LimiterWatching {
+		return fmt.Errorf("manual intervention is only available while watching")
+	}
+	m.freezeWatchedLocked(now)
+	m.state = LimiterInterventionUp
+	m.nextAction = now.Add(m.config.upDuration())
+	m.lastError = ""
 	return nil
 }
 
@@ -254,6 +332,7 @@ func (m *limiterMachine) Snapshot(now time.Time) LimiterSnapshot {
 		WatchingSince:     m.watchingSince,
 		WatchedDuration:   watched,
 		NextAction:        m.nextAction,
+		CooldownUntil:     m.cooldownUntil,
 		LastError:         m.lastError,
 	}
 }
@@ -263,6 +342,7 @@ func (m *limiterMachine) resetLocked() {
 	m.watchingSince = time.Time{}
 	m.watchedBefore = 0
 	m.nextAction = time.Time{}
+	m.cooldownUntil = time.Time{}
 	m.lastError = ""
 }
 
@@ -291,10 +371,11 @@ func (m *limiterMachine) PersistentState(now time.Time) persistedLimiterState {
 		DownDurationSeconds: int64(m.config.DownDuration / time.Second),
 		AccumulatedSeconds:  int64(m.watchedDurationLocked(now) / time.Second),
 		Phase:               phase,
+		CooldownUntil:       formatOptionalTime(m.cooldownUntil),
 	}
 }
 
-func (m *limiterMachine) Restore(state persistedLimiterState) error {
+func (m *limiterMachine) Restore(state persistedLimiterState, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if state.WatchLimitSeconds <= 0 {
@@ -322,10 +403,29 @@ func (m *limiterMachine) Restore(state persistedLimiterState) error {
 		m.state = LimiterWatching
 	case LimiterInterventionUp, LimiterInterventionDown:
 		m.state = LimiterInterventionUp
+	case LimiterCooldown:
+		until, err := time.Parse(time.RFC3339Nano, state.CooldownUntil)
+		if err != nil {
+			return fmt.Errorf("persisted cooldown deadline: %w", err)
+		}
+		if !until.After(now) {
+			m.resetLocked()
+			return nil
+		}
+		m.state = LimiterCooldown
+		m.cooldownUntil = until
+		m.nextAction = until
 	default:
 		m.resetLocked()
 	}
 	return nil
+}
+
+func formatOptionalTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func validateBlockDuration(downDuration, cycle time.Duration) error {
@@ -419,6 +519,9 @@ func (r *limiterRunner) poll(ctx context.Context) {
 	after := r.machine.Snapshot(r.now()).State
 	if r.persister != nil {
 		if before != LimiterInterventionUp && after == LimiterInterventionUp {
+			r.persister.Request(true)
+		}
+		if before != LimiterCooldown && after == LimiterCooldown {
 			r.persister.Request(true)
 		}
 		if before != LimiterIdle && after == LimiterIdle {

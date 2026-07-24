@@ -55,6 +55,7 @@
 - 连续观看限时：20 分钟，可配置。
 - 干预周期：60 秒。
 - 每周期断网：家长可设置 1–25 整数秒，默认 6 秒；默认接通 54 秒。
+- 观看结束/拔线冷却：30 分钟，期间 LAN2 保持管理 down。
 
 ### 状态机
 
@@ -64,17 +65,21 @@
 | `idle` | 其他采样 | 保持计时清零 | `idle` |
 | `watching` | 接口 up 且 `carrier=1`，未到限时 | 更新可见观看时长 | `watching` |
 | `watching` | 接口 up 且 `carrier=1`，达到限时 | 计划 `60-D` 秒后的 down | `intervention_up` |
-| `watching` | `carrier=0` 或接口非 up | 清零连续观看计时 | `idle` |
-| `intervention_up` | 接口 up 时采到 `carrier=0` | 清零计时，不执行 down | `idle` |
+| `watching` | 接口 up 时采到 `carrier=0` | 保留累计时间，立即 down LAN2，启动 30 分钟冷却 | `cooldown` |
+| `watching` | 家长点击“立即干预” | 保留累计时间，计划 `60-D` 秒后的 down | `intervention_up` |
+| `intervention_up` | 接口 up 时采到 `carrier=0` | 保留累计时间，立即 down LAN2，启动 30 分钟冷却 | `cooldown` |
 | `intervention_up` | `60-D` 秒定时到期 | 执行 down，成功后启动 D 秒定时 | `intervention_down` |
 | `intervention_down` | 任意载波采样 | 忽略载波 | `intervention_down` |
 | `intervention_down` | D 秒定时到期 | 执行 up，成功后启动 `60-D` 秒定时 | `intervention_up` |
+| `cooldown` | 未满 30 分钟 | 保持 LAN2 down；若被意外置 up，立即再次 down | `cooldown` |
+| `cooldown` | 30 分钟到期 | 执行 up；成功后清空累计时间 | `idle` |
 | 任意干预状态 | 控制动作失败 | 保持当前状态，记录错误并短间隔重试 | 当前状态 |
 | `intervention_down` | 服务正常停止 | 尽力执行 up | `idle` |
 | 任意自动状态 | 用户通过 API 手动开关 | 手动动作优先，清除自动计时和动作定时器 | `idle` |
 
-不能把主动执行 down 后产生的 `carrier=0` 误判为用户已关电视；判断退出只能
-使用接口已恢复 up 后的载波采样。
+不能把主动执行 down 后产生的 `carrier=0` 误判为儿童拔线；只能在接口管理
+状态为 up 时使用 DBus 载波判断。自动恢复 up 后若下一次采样仍为 0，则进入
+cooldown。
 
 载波只按 30 秒轮询读取；`60-D`/D 秒动作定时器使用最近一次采样，不额外
 提高 DBus 查询频率。连续观看时间按单调经过时间计算，而不是简单累加轮询
@@ -105,7 +110,10 @@
   保持不变。端口保持关闭，自动逻辑不能重新开启它。
 - 手动开启：清除当前自动计时/干预状态；如果智能限时配置为启用，则从下一次
   `carrier=1` 采样重新获得完整观看时长；如果配置原本关闭，不得自动启用。
-- 不增加“延长时间”等额外家长按钮。
+- “立即干预”仅在 `watching` 状态可用，进入 `intervention_up`，不清空已观看
+  时间；其他状态调用必须拒绝。
+- 智能限时保持启用时，修改最大观看时长或阻断时长不得清空计时、退出干预或
+  退出 cooldown；停用智能限时时才恢复端口并重置。
 
 ### 持久化设计
 

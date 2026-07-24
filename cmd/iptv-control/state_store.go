@@ -27,6 +27,7 @@ type persistedLimiterState struct {
 	DownDurationSeconds int64  `json:"down_duration_seconds,omitempty"`
 	AccumulatedSeconds  int64  `json:"accumulated_seconds"`
 	Phase               string `json:"phase"`
+	CooldownUntil       string `json:"cooldown_until,omitempty"`
 }
 
 type stateLogRecord struct {
@@ -274,5 +275,6 @@ func samePersistedContent(a, b persistedLimiterState) bool {
 		a.WatchLimitSeconds == b.WatchLimitSeconds &&
 		a.DownDurationSeconds == b.DownDurationSeconds &&
 		a.AccumulatedSeconds == b.AccumulatedSeconds &&
-		a.Phase == b.Phase
+		a.Phase == b.Phase &&
+		a.CooldownUntil == b.CooldownUntil
 }

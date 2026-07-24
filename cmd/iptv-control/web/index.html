@@ -12,6 +12,7 @@
   #on{background:#18794e;color:#fff}
   #off{background:#b42318;color:#fff}
   #save-limiter{background:#175cd3;color:#fff}
+  #intervene-now{background:#7a2e0e;color:#fff}
   label{display:block;margin:12px 0 6px;font-weight:650}
   label.switch{display:flex;gap:10px;align-items:center}
   input[type=checkbox]{width:20px;height:20px}
@@ -40,8 +41,9 @@
     <input id="max-watch-minutes" type="number" min="1" max="1440" step="1" value="20">
     <label for="block-seconds">每分钟阻断时长（秒）</label>
     <input id="block-seconds" type="number" min="1" max="25" step="1" value="6">
-    <p class="hint">达到限时后，每分钟将按设置短暂断开 LAN2，其余时间保持接通。保存设置会重新开始本次计时。</p>
+    <p class="hint">达到限时后，每分钟将按设置短暂断开 LAN2。保持启用时修改参数不会清空当前计时或退出干预。</p>
     <button id="save-limiter">保存智能限时设置</button>
+    <button id="intervene-now" disabled>立即进入干预（仅观看期间）</button>
     <p id="message"></p>
   </section>
 
@@ -60,7 +62,8 @@
     idle: '未观看',
     watching: '正在计时',
     intervention_up: '限时干预（接通阶段）',
-    intervention_down: '限时干预（断开阶段）'
+    intervention_down: '限时干预（断开阶段）',
+    cooldown: '冷却锁定（LAN2 已关闭）'
   };
   let settingsDirty = false;
   let settingsLoaded = false;
@@ -92,9 +95,14 @@
     let limiterText = limiter.enabled
       ? `${stateNames[limiter.state] || limiter.state} / 已观看约 ${watchedMinutes} 分钟`
       : '未启用';
+    if (limiter.state === 'cooldown' && limiter.cooldown_until) {
+      const remainingMs = Math.max(0, new Date(limiter.cooldown_until).getTime() - Date.now());
+      limiterText += ` / 约 ${Math.ceil(remainingMs / 60000)} 分钟后恢复`;
+    }
     if (limiter.persistence_pending) limiterText += ' / 配置待持久化';
     if (limiter.persistence_error) limiterText += ` / 持久化失败：${limiter.persistence_error}`;
     $('limiter-state').textContent = limiterText;
+    $('intervene-now').disabled = limiter.state !== 'watching';
     if (!settingsLoaded || !settingsDirty) {
       $('limiter-enabled').checked = limiter.enabled;
       $('max-watch-minutes').value = limiter.watch_limit_minutes;
@@ -163,9 +171,23 @@
     }
   }
 
+  async function interveneNow() {
+    $('intervene-now').disabled = true;
+    $('message').textContent = '正在进入干预...';
+    try {
+      const status = await request('/api/v1/intervene', {method: 'POST'});
+      render(status);
+      $('message').textContent = '已进入限时干预。';
+    } catch (error) {
+      $('message').textContent = `操作失败：${error.message}`;
+      await refresh();
+    }
+  }
+
   $('on').onclick = () => setPort(true);
   $('off').onclick = () => setPort(false);
   $('save-limiter').onclick = saveLimiter;
+  $('intervene-now').onclick = interveneNow;
   refresh();
   setInterval(refresh, 5000);
 </script>
