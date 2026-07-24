@@ -173,7 +173,7 @@ func TestLimiterSettingsEnableAndChangeWatchLimit(t *testing.T) {
 	cfg.Enabled = false
 	m := newLimiterMachine(cfg)
 
-	if err := m.UpdateSettings(context.Background(), true, 45*time.Minute, func(context.Context, bool) error {
+	if err := m.UpdateSettings(context.Background(), true, 45*time.Minute, 12*time.Second, func(context.Context, bool) error {
 		t.Fatal("unexpected port action")
 		return nil
 	}); err != nil {
@@ -181,8 +181,24 @@ func TestLimiterSettingsEnableAndChangeWatchLimit(t *testing.T) {
 	}
 
 	snapshot := m.Snapshot(time.Now())
-	if !snapshot.Enabled || snapshot.WatchLimitMinutes != 45 || snapshot.State != LimiterIdle {
+	if !snapshot.Enabled || snapshot.WatchLimitMinutes != 45 || snapshot.BlockSeconds != 12 ||
+		snapshot.State != LimiterIdle {
 		t.Fatalf("unexpected settings: %+v", snapshot)
+	}
+}
+
+func TestLimiterSettingsRejectInvalidBlockSeconds(t *testing.T) {
+	m := newLimiterMachine(defaultLimiterConfig())
+	for _, duration := range []time.Duration{0, 26 * time.Second, 1500 * time.Millisecond} {
+		if err := m.UpdateSettings(
+			context.Background(),
+			true,
+			20*time.Minute,
+			duration,
+			func(context.Context, bool) error { return nil },
+		); err == nil {
+			t.Fatalf("expected block duration %v to fail", duration)
+		}
 	}
 }
 
@@ -199,7 +215,7 @@ func TestDisablingLimiterRestoresAutomaticDown(t *testing.T) {
 	m.Step(context.Background(), start.Add(cfg.WatchLimit), watchingStatus(), set)
 	m.Step(context.Background(), start.Add(cfg.WatchLimit+cfg.upDuration()), watchingStatus(), set)
 
-	if err := m.UpdateSettings(context.Background(), false, 30*time.Minute, set); err != nil {
+	if err := m.UpdateSettings(context.Background(), false, 30*time.Minute, 6*time.Second, set); err != nil {
 		t.Fatal(err)
 	}
 
@@ -233,6 +249,17 @@ func TestLimiterConfigRejectsInvalidDurations(t *testing.T) {
 	t.Setenv("IPTV_LIMITER_DOWN_DURATION", "3s")
 	if _, err := limiterConfigFromEnv(); err == nil {
 		t.Fatal("expected invalid duration error")
+	}
+}
+
+func TestLimiterConfigRejectsBlockDurationOutsideParentRange(t *testing.T) {
+	for _, value := range []string{"500ms", "26s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("IPTV_LIMITER_DOWN_DURATION", value)
+			if _, err := limiterConfigFromEnv(); err == nil {
+				t.Fatalf("expected %s to fail", value)
+			}
+		})
 	}
 }
 
@@ -280,8 +307,8 @@ func TestLimiterRunnerCanBeEnabledAtRuntime(t *testing.T) {
 		Enabled:      false,
 		PollInterval: 5 * time.Millisecond,
 		WatchLimit:   15 * time.Millisecond,
-		Cycle:        20 * time.Millisecond,
-		DownDuration: 5 * time.Millisecond,
+		Cycle:        1100 * time.Millisecond,
+		DownDuration: time.Second,
 		ActionRetry:  time.Millisecond,
 	}
 	runner := newLimiterRunner(cfg, controller)
@@ -291,7 +318,7 @@ func TestLimiterRunnerCanBeEnabledAtRuntime(t *testing.T) {
 		runner.Run(ctx)
 		close(done)
 	}()
-	if err := runner.machine.UpdateSettings(ctx, true, cfg.WatchLimit, controller.SetEnabled); err != nil {
+	if err := runner.machine.UpdateSettings(ctx, true, cfg.WatchLimit, cfg.DownDuration, controller.SetEnabled); err != nil {
 		t.Fatal(err)
 	}
 	if got := waitAction(t, controller.calls); got {

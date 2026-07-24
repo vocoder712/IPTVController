@@ -15,6 +15,9 @@ const (
 	LimiterWatching         LimiterState = "watching"
 	LimiterInterventionUp   LimiterState = "intervention_up"
 	LimiterInterventionDown LimiterState = "intervention_down"
+
+	minBlockSeconds = 1
+	maxBlockSeconds = 25
 )
 
 type LimiterConfig struct {
@@ -80,6 +83,10 @@ func (c LimiterConfig) Validate() error {
 		return fmt.Errorf("cycle must be positive")
 	case c.DownDuration <= 0:
 		return fmt.Errorf("down duration must be positive")
+	case c.DownDuration%time.Second != 0:
+		return fmt.Errorf("down duration must be a whole number of seconds")
+	case c.DownDuration < minBlockSeconds*time.Second || c.DownDuration > maxBlockSeconds*time.Second:
+		return fmt.Errorf("down duration must be between %d and %d seconds", minBlockSeconds, maxBlockSeconds)
 	case c.DownDuration >= c.Cycle:
 		return fmt.Errorf("down duration must be shorter than cycle")
 	case c.ActionRetry <= 0:
@@ -97,6 +104,7 @@ type LimiterSnapshot struct {
 	Enabled            bool          `json:"enabled"`
 	State              LimiterState  `json:"state"`
 	WatchLimitMinutes  int           `json:"watch_limit_minutes"`
+	BlockSeconds       int           `json:"block_seconds"`
 	WatchingSince      time.Time     `json:"watching_since,omitempty"`
 	WatchedDuration    time.Duration `json:"watched_duration"`
 	NextAction         time.Time     `json:"next_action,omitempty"`
@@ -200,11 +208,20 @@ func (m *limiterMachine) Stop(ctx context.Context, setEnabled func(context.Conte
 	return nil
 }
 
-func (m *limiterMachine) UpdateSettings(ctx context.Context, enabled bool, watchLimit time.Duration, setEnabled func(context.Context, bool) error) error {
+func (m *limiterMachine) UpdateSettings(
+	ctx context.Context,
+	enabled bool,
+	watchLimit time.Duration,
+	downDuration time.Duration,
+	setEnabled func(context.Context, bool) error,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if watchLimit <= 0 {
 		return fmt.Errorf("watch limit must be positive")
+	}
+	if err := validateBlockDuration(downDuration, m.config.Cycle); err != nil {
+		return err
 	}
 	if m.state == LimiterInterventionDown {
 		if err := setEnabled(ctx, true); err != nil {
@@ -214,6 +231,7 @@ func (m *limiterMachine) UpdateSettings(ctx context.Context, enabled bool, watch
 	}
 	m.config.Enabled = enabled
 	m.config.WatchLimit = watchLimit
+	m.config.DownDuration = downDuration
 	m.resetLocked()
 	return nil
 }
@@ -232,6 +250,7 @@ func (m *limiterMachine) Snapshot(now time.Time) LimiterSnapshot {
 		Enabled:           m.config.Enabled,
 		State:             m.state,
 		WatchLimitMinutes: int(m.config.WatchLimit / time.Minute),
+		BlockSeconds:      int(m.config.DownDuration / time.Second),
 		WatchingSince:     m.watchingSince,
 		WatchedDuration:   watched,
 		NextAction:        m.nextAction,
@@ -266,11 +285,12 @@ func (m *limiterMachine) PersistentState(now time.Time) persistedLimiterState {
 		phase = string(LimiterInterventionUp)
 	}
 	return persistedLimiterState{
-		SavedAt:            now.UTC().Format(time.RFC3339Nano),
-		Enabled:            m.config.Enabled,
-		WatchLimitSeconds:  int64(m.config.WatchLimit / time.Second),
-		AccumulatedSeconds: int64(m.watchedDurationLocked(now) / time.Second),
-		Phase:              phase,
+		SavedAt:             now.UTC().Format(time.RFC3339Nano),
+		Enabled:             m.config.Enabled,
+		WatchLimitSeconds:   int64(m.config.WatchLimit / time.Second),
+		DownDurationSeconds: int64(m.config.DownDuration / time.Second),
+		AccumulatedSeconds:  int64(m.watchedDurationLocked(now) / time.Second),
+		Phase:               phase,
 	}
 }
 
@@ -280,8 +300,16 @@ func (m *limiterMachine) Restore(state persistedLimiterState) error {
 	if state.WatchLimitSeconds <= 0 {
 		return fmt.Errorf("persisted watch limit must be positive")
 	}
+	downDuration := m.config.DownDuration
+	if state.DownDurationSeconds != 0 {
+		downDuration = time.Duration(state.DownDurationSeconds) * time.Second
+	}
+	if err := validateBlockDuration(downDuration, m.config.Cycle); err != nil {
+		return fmt.Errorf("persisted block duration: %w", err)
+	}
 	m.config.Enabled = state.Enabled
 	m.config.WatchLimit = time.Duration(state.WatchLimitSeconds) * time.Second
+	m.config.DownDuration = downDuration
 	m.resetLocked()
 	if !state.Enabled {
 		return nil
@@ -298,6 +326,19 @@ func (m *limiterMachine) Restore(state persistedLimiterState) error {
 		m.resetLocked()
 	}
 	return nil
+}
+
+func validateBlockDuration(downDuration, cycle time.Duration) error {
+	switch {
+	case downDuration%time.Second != 0:
+		return fmt.Errorf("block_seconds must be a whole number")
+	case downDuration < minBlockSeconds*time.Second || downDuration > maxBlockSeconds*time.Second:
+		return fmt.Errorf("block_seconds must be between %d and %d", minBlockSeconds, maxBlockSeconds)
+	case downDuration >= cycle:
+		return fmt.Errorf("block duration must be shorter than cycle")
+	default:
+		return nil
+	}
 }
 
 func isWatching(status PortStatus) bool {

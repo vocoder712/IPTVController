@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -123,14 +124,32 @@ func TestUpdateLimiterSettings(t *testing.T) {
 	a.limiterSettings(rr, httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/limiter",
-		strings.NewReader(`{"enabled":true,"max_watch_minutes":35}`),
+		strings.NewReader(`{"enabled":true,"max_watch_minutes":35,"block_seconds":14}`),
 	))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	snapshot := machine.Snapshot(time.Now())
-	if !snapshot.Enabled || snapshot.WatchLimitMinutes != 35 {
+	if !snapshot.Enabled || snapshot.WatchLimitMinutes != 35 || snapshot.BlockSeconds != 14 {
 		t.Fatalf("unexpected limiter settings: %+v", snapshot)
+	}
+}
+
+func TestUpdateLimiterSettingsKeepsBlockSecondsForOldClient(t *testing.T) {
+	f := &fakeController{}
+	machine := newLimiterMachine(defaultLimiterConfig())
+	a := &app{controller: f, limiter: machine}
+	rr := httptest.NewRecorder()
+	a.limiterSettings(rr, httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/limiter",
+		strings.NewReader(`{"enabled":true,"max_watch_minutes":30}`),
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := machine.Snapshot(time.Now()).BlockSeconds; got != 6 {
+		t.Fatalf("block_seconds=%d, want 6", got)
 	}
 }
 
@@ -147,6 +166,18 @@ func TestUpdateLimiterSettingsRejectsInvalidMinutes(t *testing.T) {
 	}
 }
 
+func TestUpdateLimiterSettingsRejectsInvalidBlockSeconds(t *testing.T) {
+	for _, seconds := range []int{0, 26} {
+		a := &app{controller: &fakeController{}, limiter: newLimiterMachine(defaultLimiterConfig())}
+		body := fmt.Sprintf(`{"enabled":true,"max_watch_minutes":20,"block_seconds":%d}`, seconds)
+		rr := httptest.NewRecorder()
+		a.limiterSettings(rr, httptest.NewRequest(http.MethodPost, "/api/v1/limiter", strings.NewReader(body)))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("block_seconds=%d status=%d body=%s", seconds, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 func TestEmbeddedPageContainsLimiterControls(t *testing.T) {
 	page, err := webFS.ReadFile("web/index.html")
 	if err != nil {
@@ -156,9 +187,10 @@ func TestEmbeddedPageContainsLimiterControls(t *testing.T) {
 	for _, required := range []string{
 		`id="limiter-enabled"`,
 		`id="max-watch-minutes"`,
+		`id="block-seconds"`,
 		`id="save-limiter"`,
 		`/api/v1/limiter`,
-		`接通 54 秒、断开 6 秒`,
+		`min="1" max="25"`,
 	} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("page missing %q", required)

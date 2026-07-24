@@ -19,13 +19,14 @@ const (
 )
 
 type persistedLimiterState struct {
-	Version            int    `json:"version"`
-	Sequence           uint64 `json:"sequence"`
-	SavedAt            string `json:"saved_at"`
-	Enabled            bool   `json:"enabled"`
-	WatchLimitSeconds  int64  `json:"watch_limit_seconds"`
-	AccumulatedSeconds int64  `json:"accumulated_seconds"`
-	Phase              string `json:"phase"`
+	Version             int    `json:"version"`
+	Sequence            uint64 `json:"sequence"`
+	SavedAt             string `json:"saved_at"`
+	Enabled             bool   `json:"enabled"`
+	WatchLimitSeconds   int64  `json:"watch_limit_seconds"`
+	DownDurationSeconds int64  `json:"down_duration_seconds,omitempty"`
+	AccumulatedSeconds  int64  `json:"accumulated_seconds"`
+	Phase               string `json:"phase"`
 }
 
 type stateLogRecord struct {
@@ -271,6 +272,7 @@ func (p *statePersister) Status() (pending bool, lastError string) {
 func samePersistedContent(a, b persistedLimiterState) bool {
 	return a.Enabled == b.Enabled &&
 		a.WatchLimitSeconds == b.WatchLimitSeconds &&
+		a.DownDurationSeconds == b.DownDurationSeconds &&
 		a.AccumulatedSeconds == b.AccumulatedSeconds &&
 		a.Phase == b.Phase
 }

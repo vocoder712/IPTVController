@@ -2,12 +2,52 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 )
+
+func TestStateStoreLoadsLegacyRecordWithoutBlockDuration(t *testing.T) {
+	type legacyState struct {
+		Version            int    `json:"version"`
+		Sequence           uint64 `json:"sequence"`
+		SavedAt            string `json:"saved_at"`
+		Enabled            bool   `json:"enabled"`
+		WatchLimitSeconds  int64  `json:"watch_limit_seconds"`
+		AccumulatedSeconds int64  `json:"accumulated_seconds"`
+		Phase              string `json:"phase"`
+	}
+	legacy := legacyState{
+		Version:           persistedStateVersion,
+		Sequence:          7,
+		SavedAt:           "2026-07-24T12:00:00Z",
+		Enabled:           true,
+		WatchLimitSeconds: 300,
+		Phase:             string(LimiterIdle),
+	}
+	payload, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(`{"state":%s,"crc32":%d}`+"\n", payload, crc32.ChecksumIEEE(payload))
+	path := filepath.Join(t.TempDir(), "state.log")
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := newStateStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sequence != 7 || got.WatchLimitSeconds != 300 || got.DownDurationSeconds != 0 {
+		t.Fatalf("unexpected legacy state: %+v", got)
+	}
+}
 
 func TestStateStoreLoadsLatestValidRecordAndIgnoresTornTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "state.log")
@@ -87,10 +127,11 @@ func TestLimiterRestoresAccumulatedWatchingTime(t *testing.T) {
 	cfg.Enabled = false
 	m := newLimiterMachine(cfg)
 	if err := m.Restore(persistedLimiterState{
-		Enabled:            true,
-		WatchLimitSeconds:  20 * 60,
-		AccumulatedSeconds: 10 * 60,
-		Phase:              string(LimiterWatching),
+		Enabled:             true,
+		WatchLimitSeconds:   20 * 60,
+		DownDurationSeconds: 17,
+		AccumulatedSeconds:  10 * 60,
+		Phase:               string(LimiterWatching),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -98,13 +139,40 @@ func TestLimiterRestoresAccumulatedWatchingTime(t *testing.T) {
 	set := func(context.Context, bool) error { return nil }
 	m.Step(context.Background(), start, watchingStatus(), set)
 	snapshot := m.Snapshot(start)
-	if snapshot.State != LimiterWatching || snapshot.WatchedDuration != 10*time.Minute {
+	if snapshot.State != LimiterWatching || snapshot.WatchedDuration != 10*time.Minute ||
+		snapshot.BlockSeconds != 17 {
 		t.Fatalf("unexpected restored watching state: %+v", snapshot)
 	}
 	m.Step(context.Background(), start.Add(10*time.Minute), watchingStatus(), set)
 	snapshot = m.Snapshot(start.Add(10 * time.Minute))
 	if snapshot.State != LimiterInterventionUp {
 		t.Fatalf("state=%s, want intervention_up", snapshot.State)
+	}
+}
+
+func TestLimiterRestoresLegacyStateWithDefaultBlockDuration(t *testing.T) {
+	cfg := defaultLimiterConfig()
+	m := newLimiterMachine(cfg)
+	if err := m.Restore(persistedLimiterState{
+		Enabled:           true,
+		WatchLimitSeconds: 20 * 60,
+		Phase:             string(LimiterIdle),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Snapshot(time.Now()).BlockSeconds; got != 6 {
+		t.Fatalf("legacy block duration=%d, want 6", got)
+	}
+}
+
+func TestLimiterRejectsInvalidPersistedBlockDuration(t *testing.T) {
+	m := newLimiterMachine(defaultLimiterConfig())
+	if err := m.Restore(persistedLimiterState{
+		Enabled:             true,
+		WatchLimitSeconds:   20 * 60,
+		DownDurationSeconds: 26,
+	}); err == nil {
+		t.Fatal("expected invalid persisted block duration")
 	}
 }
 
@@ -166,7 +234,7 @@ func TestStatePersisterCoalescesWritesWithinMinimumGap(t *testing.T) {
 	if err := p.FlushDue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpdateSettings(context.Background(), true, 30*time.Minute, func(context.Context, bool) error {
+	if err := m.UpdateSettings(context.Background(), true, 30*time.Minute, 18*time.Second, func(context.Context, bool) error {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -194,6 +262,9 @@ func TestStatePersisterCoalescesWritesWithinMinimumGap(t *testing.T) {
 	}
 	if after.WatchLimitSeconds != 30*60 {
 		t.Fatalf("coalesced state was not flushed: %+v", after)
+	}
+	if after.DownDurationSeconds != 18 {
+		t.Fatalf("block duration was not persisted: %+v", after)
 	}
 }
 

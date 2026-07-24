@@ -278,6 +278,7 @@ func (a *app) limiterSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled         *bool `json:"enabled"`
 		MaxWatchMinutes *int  `json:"max_watch_minutes"`
+		BlockSeconds    *int  `json:"block_seconds"`
 	}
 	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Enabled == nil || req.MaxWatchMinutes == nil {
 		http.Error(w, "enabled and max_watch_minutes are required", http.StatusBadRequest)
@@ -287,10 +288,19 @@ func (a *app) limiterSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "max_watch_minutes must be between 1 and 1440", http.StatusBadRequest)
 		return
 	}
+	blockSeconds := a.limiter.Snapshot(a.nowTime()).BlockSeconds
+	if req.BlockSeconds != nil {
+		blockSeconds = *req.BlockSeconds
+	}
+	if blockSeconds < minBlockSeconds || blockSeconds > maxBlockSeconds {
+		http.Error(w, "block_seconds must be between 1 and 25", http.StatusBadRequest)
+		return
+	}
 	if err := a.limiter.UpdateSettings(
 		r.Context(),
 		*req.Enabled,
 		time.Duration(*req.MaxWatchMinutes)*time.Minute,
+		time.Duration(blockSeconds)*time.Second,
 		a.controller.SetEnabled,
 	); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -300,6 +310,13 @@ func (a *app) limiterSettings(w http.ResponseWriter, r *http.Request) {
 		a.persister.Request(false)
 	}
 	writeJSON(w, http.StatusOK, a.readStatus(r.Context()))
+}
+
+func (a *app) nowTime() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

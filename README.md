@@ -99,11 +99,12 @@ H5 配置和持久化已完成开发机与设备基础验证。
 | `IPTV_LIMITER_POLL_INTERVAL` | `30s` | 载波查询间隔 |
 | `IPTV_LIMITER_WATCH_LIMIT` | `20m` | 连续观看限时 |
 | `IPTV_LIMITER_CYCLE` | `1m` | 干预周期 |
-| `IPTV_LIMITER_DOWN_DURATION` | `6s` | 每周期关闭 LAN2 的时长 |
+| `IPTV_LIMITER_DOWN_DURATION` | `6s` | 默认阻断时长；必须为 1–25 整数秒 |
 | `IPTV_CONTROL_STATE_FILE` | 未设置 | 持久状态日志；设备使用 `$BASE/state/state.log` |
 
-达到限时后先保持接口开启 54 秒，再关闭 6 秒，循环执行。用户通过 API 手动
-开关时，手动动作优先并清除当前自动计时。完整状态转移表见
+达到限时后按 60 秒周期循环，家长可在 H5 设置每周期阻断 1–25 秒，其余时间
+保持接口接通；默认是接通 54 秒、阻断 6 秒。用户通过 API 手动开关时，
+手动动作优先并清除当前自动计时。完整状态转移表见
 [`.codex/PLAN.md`](.codex/PLAN.md)。
 
 SG631Z 实际模式下，观看状态来自厂商 DBus 的只读 `LAN2Status`，不使用启动
@@ -117,8 +118,10 @@ H5 页面可直接启用或停用智能限时，并设置 1 到 1440 分钟的�
 POST /api/v1/limiter
 Content-Type: application/json
 
-{"enabled":true,"max_watch_minutes":20}
+{"enabled":true,"max_watch_minutes":20,"block_seconds":6}
 ```
+
+`block_seconds` 可省略以兼容旧客户端；省略时保留当前阻断时长。
 
 设置路径非空时，服务使用带 CRC 的追加日志持久化配置和累计观看时间。进度
 每 5 分钟检查点一次，配置写入在 30 秒窗口内合并，日志达到 64 KiB 时原子
