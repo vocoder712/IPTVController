@@ -20,7 +20,8 @@
 - `PortController` 抽象；开发默认模拟执行器，设备上设置 `IPTV_CONTROL_REAL=1` 后调用 `/bin/ip`。
 - 启动时检查 UID、`eth1`、能力和工具；定期读取接口状态并报告厂商回拉。
 - 状态和最后一次手动状态使用原子 JSON 保存；日志优先写入易失目录。
-- 提供 `/opt/cu/apps/apps/root/scripts/iptv-control-start.sh` 启动脚本模板，不自动修改光猫。
+- 提供 `deploy/bootshell.sh` 固定启动入口模板，使用容器路径
+  `/opt/apps/iptv-control`；真实控制默认禁用。
 
 ## 验证分层
 

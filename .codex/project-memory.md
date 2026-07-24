@@ -33,6 +33,10 @@ IPTV VLAN/组播分析或厂商网页 API。阶段计划以 `.codex/PLAN.md` 为
   `192.168.1.1:8088`。
 - 持久应用目录：`/opt/cu/apps/apps/opt/apps/`。
 - 启动脚本目录：`/opt/cu/apps/apps/root/scripts/`。
+- 系统不会遍历执行启动脚本目录。OpenWrt 的
+  `/opt/cu/apps/apps/etc/init.d/done` 在 `START=95` 的 `boot()` 中只调用
+  固定入口 `/root/scripts/bootshell.sh`；自定义服务必须由
+  `bootshell.sh` 显式启动。
 - 光猫根文件系统和部分运行目录易失，设备每天可能自动重启；Telnet 重启后
   会关闭。
 - 设备可用空间很少，应使用精简日志并优先写入 `/var` 等易失目录。
@@ -49,7 +53,7 @@ cmd/iptv-control/
   main_test.go                  HTTP handler 单元测试
   web/index.html                内嵌的最小 H5 页面
 deploy/
-  iptv-control-start.sh         光猫启动脚本模板
+  bootshell.sh                  光猫固定启动入口模板
 docs/
   基本信息.md                   拓扑、设备环境、可靠开关方法和实机记录
   运行与部署.md                 三种模式、部署步骤、API 验证和安全切换
@@ -97,8 +101,8 @@ go.mod                         Go 1.22，无第三方依赖
 
 - `Makefile` 提供 `test`、`run`、`build-arm`。
 - Go 缓存可放在项目 `.cache` 下，`.cache` 和 `dist` 已被忽略。
-- `deploy/iptv-control-start.sh` 配置监听地址和 `eth1`，但
-  `IPTV_CONTROL_REAL=1` 仍被注释，因此模板默认是模拟模式。
+- `deploy/bootshell.sh` 是光猫固定启动入口模板，使用容器路径启动 cpolar 和
+  IPTV 模拟服务；`IPTV_CONTROL_REAL=1` 仍被注释。
 - `README.md` 提供本地开发、设备模拟、设备实际三种模式的快速对照。
 - `docs/运行与部署.md` 提供从本地开发到 ARMv7 构建、设备模拟验证、实际
   模式切换、API 调用和故障排查的完整步骤。
@@ -150,10 +154,13 @@ go.mod                         Go 1.22，无第三方依赖
 2026-07-23 早期检查时，`192.168.1.1:8088` 可建立 TCP 连接但 HTTP
 无响应。部署当前 GOARM=5 构建后该问题已消失：
 
-- 模拟服务 PID 为 `15948`，监听 `192.168.1.1:8088`。
+- 重启前，模拟服务 PID 为 `15948`，监听 `192.168.1.1:8088`。
 - 日志明确显示 `real=false`，进程环境中没有 `IPTV_CONTROL_REAL`。
 - `/healthz`、状态 API、模拟开关 API 和 H5 首页均验证通过。
-- 服务已安装到持久目录，但尚未通过设备重启验证开机自动运行。
+- 服务已安装到持久目录。
+- 用户随后重启设备，验证发现服务没有自动运行。根因是
+  `iptv-control-start.sh` 没有被固定入口 `bootshell.sh` 引用，不是程序
+  或持久文件损坏。
 
 ## 本地验证基线
 
@@ -214,30 +221,44 @@ go build -trimpath -ldflags="-s -w" -o dist/iptv-control ./cmd/iptv-control
 
 ## 当前任务
 
-任务：将当前 ARMv7 构建部署到 SG631Z 持久目录，并以设备模拟模式验证
-HTTP API 和 H5。
+任务：按用户要求改为只使用 `bootshell.sh`，删除独立
+`iptv-control-start.sh`，修正设备启动入口并重启验证。
 
 状态：已完成。
 
-完成结果：
+2026-07-24 继续执行：重新上传 `deploy/bootshell.sh` 后，将同时通过主系统
+持久路径和运行中容器进程的 `/proc/<pid>/root` 视角验证文件与二进制。只有
+容器视角确认后才重启；重启验收以 8088/API 实际可用为准，而不是仅依赖
+主系统视角的文件校验。
 
-- 本地 `go test ./...` 通过。
-- 初始 GOARM=7 二进制上传和 SHA-256 校验成功，但设备因 CPU 无 VFP 支持
-  报 `Illegal instruction`；服务未启动，未触发任何端口控制。
-- 改用 `GOARM=5` 重新构建、上传和校验。正式二进制：
-  - 路径：`/opt/cu/apps/apps/opt/apps/iptv-control/iptv-control`
-  - 大小：6,160,546 bytes
-  - SHA-256：`202ff3c4fdcf062ffacd468a0deb94e3cbc56f15ecc773cf8867a2fa1a64b75b`
-- 启动脚本已安装到
-  `/opt/cu/apps/apps/root/scripts/iptv-control-start.sh`，SHA-256 为
-  `da209ee5ed781e102e1f9e6dbd41dc5d3002fd68f74c995f3727f24c9b2e4a74`，
-  `IPTV_CONTROL_REAL=1` 保持注释。
-- 模拟服务 PID `15948` 正常监听 `192.168.1.1:8088`，日志为
-  `interface=eth1 real=false`。
-- `/healthz` 返回 `ok=true`、`real_control=false`；状态返回
-  `capability_check=simulation`；模拟开启、关闭和 H5 HTTP 200 均通过。
-- 模拟 API 操作前后，真实 `eth1` 都保持管理 UP、无载波、
-  `operstate=down`、`carrier=0`，确认未修改 LAN2。
-- 已删除 `/var` 的两个上传临时文件和持久目录中的 GOARM=7 不兼容副本；
-  这些设备文件不可恢复，但可从本地源码重新构建。
-- 未重启光猫，未启用真实模式，未执行真实端口开关。
+实施计划：
+
+- 本地部署模板改为单一 `deploy/bootshell.sh`，使用容器路径
+  `/opt/apps/iptv-control`，cpolar 和 IPTV 服务均后台启动。
+- 上传并校验新的 `bootshell.sh`，替换前保留当前文件备份。
+- 删除设备上的 `/root/scripts/iptv-control-start.sh`。
+- 重启光猫，等待系统和网络恢复；Telnet 需由用户重启后重新开启时按实际
+  可用状态检查。
+- 验证 cpolar/IPTV 进程、8088、日志、H5/API 和 `real_control=false`；
+  不操作真实 LAN2。
+
+完成结果（2026-07-24）：
+
+- 仓库部署模板已改为单一 `deploy/bootshell.sh`，删除
+  `deploy/iptv-control-start.sh`。
+- 设备上的 `/root/scripts/iptv-control-start.sh` 已删除；原
+  `bootshell.sh` 保留为 `bootshell.sh.prev`。
+- 新 `bootshell.sh` 使用容器路径 `/opt/apps/iptv-control`，cpolar 和
+  IPTV 服务均后台启动，`IPTV_CONTROL_REAL=1` 保持注释。
+- 重新上传后，已通过 cpolar 容器进程的 `/proc/<pid>/root` 视角确认：
+  - `/root/scripts/bootshell.sh` SHA-256 为
+    `f8698ad534c2865117e952b3b2907fba631df54e9d4bf1ece7d4375e557bf060`；
+  - `/opt/apps/iptv-control/iptv-control` SHA-256 为
+    `202ff3c4fdcf062ffacd468a0deb94e3cbc56f15ecc773cf8867a2fa1a64b75b`；
+  - 容器根目录下 `sh -n /root/scripts/bootshell.sh` 返回 0。
+- 已执行 `sync; reboot`。重启后不依赖 Telnet，8088 自动恢复：
+  - `/healthz` 返回 `ok=true`、`real_control=false`；
+  - `/api/v1/status` 返回 `capability_check=simulation`；
+  - H5 首页返回 HTTP 200。
+- 结论：单一 `bootshell.sh` 开机自启链已经通过真实重启验证，
+  服务当前保持设备模拟模式，未操作真实 LAN2。
