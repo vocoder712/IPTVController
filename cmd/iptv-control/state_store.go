@@ -14,20 +14,24 @@ import (
 )
 
 const (
-	persistedStateVersion = 1
+	persistedStateVersion = 2
 	defaultStateLogLimit  = 64 * 1024
 )
 
+var errStateVersionMismatch = errors.New("persisted state version mismatch")
+
 type persistedLimiterState struct {
-	Version             int    `json:"version"`
-	Sequence            uint64 `json:"sequence"`
-	SavedAt             string `json:"saved_at"`
-	Enabled             bool   `json:"enabled"`
-	WatchLimitSeconds   int64  `json:"watch_limit_seconds"`
-	DownDurationSeconds int64  `json:"down_duration_seconds,omitempty"`
-	AccumulatedSeconds  int64  `json:"accumulated_seconds"`
-	Phase               string `json:"phase"`
-	CooldownUntil       string `json:"cooldown_until,omitempty"`
+	Version                int    `json:"version"`
+	Sequence               uint64 `json:"sequence"`
+	SavedAt                string `json:"saved_at"`
+	Enabled                bool   `json:"enabled"`
+	WatchLimitSeconds      int64  `json:"watch_limit_seconds"`
+	MinDownDurationSeconds int64  `json:"min_down_duration_seconds"`
+	MaxDownDurationSeconds int64  `json:"max_down_duration_seconds"`
+	AccumulatedSeconds     int64  `json:"accumulated_seconds"`
+	Phase                  string `json:"phase"`
+	CooldownUntil          string `json:"cooldown_until,omitempty"`
+	NoCarrierWindows       int    `json:"no_carrier_windows,omitempty"`
 }
 
 type stateLogRecord struct {
@@ -58,11 +62,27 @@ func (s *stateStore) Load() (persistedLimiterState, error) {
 
 	var latest persistedLimiterState
 	found := false
+	versionMismatch := false
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
+		var envelope struct {
+			State json.RawMessage `json:"state"`
+			CRC32 uint32          `json:"crc32"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &envelope) != nil ||
+			crc32.ChecksumIEEE(envelope.State) != envelope.CRC32 {
+			continue
+		}
 		var record stateLogRecord
-		if json.Unmarshal(scanner.Bytes(), &record) != nil || !validStateRecord(record) {
+		if json.Unmarshal(scanner.Bytes(), &record) != nil {
+			continue
+		}
+		if record.State.Version != persistedStateVersion {
+			versionMismatch = true
+			continue
+		}
+		if record.State.Sequence == 0 {
 			continue
 		}
 		if !found || record.State.Sequence > latest.Sequence {
@@ -74,10 +94,24 @@ func (s *stateStore) Load() (persistedLimiterState, error) {
 		return persistedLimiterState{}, fmt.Errorf("scan state log: %w", err)
 	}
 	if !found {
+		if versionMismatch {
+			return persistedLimiterState{}, errStateVersionMismatch
+		}
 		return persistedLimiterState{}, fmt.Errorf("state log has no valid records")
 	}
 	s.sequence = latest.Sequence
 	return latest, nil
+}
+
+func (s *stateStore) Clear() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.Remove(s.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove incompatible state log: %w", err)
+	}
+	s.sequence = 0
+	return nil
 }
 
 func (s *stateStore) Save(state persistedLimiterState) error {
@@ -165,6 +199,10 @@ func validStateRecord(record stateLogRecord) bool {
 	if record.State.Version != persistedStateVersion || record.State.Sequence == 0 {
 		return false
 	}
+	return validStateChecksum(record)
+}
+
+func validStateChecksum(record stateLogRecord) bool {
 	payload, err := json.Marshal(record.State)
 	return err == nil && crc32.ChecksumIEEE(payload) == record.CRC32
 }
@@ -273,8 +311,10 @@ func (p *statePersister) Status() (pending bool, lastError string) {
 func samePersistedContent(a, b persistedLimiterState) bool {
 	return a.Enabled == b.Enabled &&
 		a.WatchLimitSeconds == b.WatchLimitSeconds &&
-		a.DownDurationSeconds == b.DownDurationSeconds &&
+		a.MinDownDurationSeconds == b.MinDownDurationSeconds &&
+		a.MaxDownDurationSeconds == b.MaxDownDurationSeconds &&
 		a.AccumulatedSeconds == b.AccumulatedSeconds &&
 		a.Phase == b.Phase &&
-		a.CooldownUntil == b.CooldownUntil
+		a.CooldownUntil == b.CooldownUntil &&
+		a.NoCarrierWindows == b.NoCarrierWindows
 }

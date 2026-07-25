@@ -117,18 +117,20 @@ H5 配置和持久化已完成开发机与设备基础验证。
 | `IPTV_LIMITER_ENABLED` | 未设置 | 只有精确值 `1` 才启用 |
 | `IPTV_LIMITER_POLL_INTERVAL` | `30s` | 载波查询间隔 |
 | `IPTV_LIMITER_WATCH_LIMIT` | `20m` | 连续观看限时 |
-| `IPTV_LIMITER_CYCLE` | `1m` | 干预周期 |
-| `IPTV_LIMITER_DOWN_DURATION` | `6s` | 默认阻断时长；必须为 1–25 整数秒 |
+| `IPTV_LIMITER_CYCLE` | `30s` | 干预周期 |
+| `IPTV_LIMITER_MIN_DOWN_DURATION` | `1s` | 随机阻断下限；必须为 1–26 整数秒 |
+| `IPTV_LIMITER_MAX_DOWN_DURATION` | `26s` | 随机阻断上限；必须为 1–26 整数秒且不小于下限 |
 | `IPTV_CONTROL_STATE_FILE` | 未设置 | 持久状态日志；设备使用 `$BASE/state/state.log` |
 
-达到限时后按 60 秒周期循环，家长可在 H5 设置每周期阻断 1–25 秒，其余时间
-保持接口接通；默认是接通 54 秒、阻断 6 秒。用户通过 API 手动开关时，
+达到限时后按 30 秒周期循环，每周期先在家长设置的 1–26 秒范围内随机阻断，
+再接通剩余时间。连续两个接通窗口结束时都没有载波，才认为电视已关闭。
+用户通过 API 手动开关时，
 手动动作优先并清除当前自动计时。完整状态转移表见
 [`.codex/PLAN.md`](.codex/PLAN.md)。
 
-进入观看后，如果机顶盒关机、网线被拔出，或干预接通阶段检测到物理载波
-消失，服务会保留累计观看时间并关闭 LAN2 30 分钟；冷却到期才恢复端口并
-清空累计时间。冷却截止时间持久化，重启不能绕过。H5 的“立即进入干预”
+进入观看后，如果机顶盒关机或网线被拔出，服务会保留累计观看时间并关闭
+LAN2 30 分钟；干预阶段则采用连续两个接通窗口无载波的判定。冷却到期才恢复
+端口并清空累计时间。冷却截止时间持久化，重启不能绕过。H5 的“立即进入干预”
 按钮仅在 `watching` 状态可用。
 
 SG631Z 实际模式下，观看状态来自厂商 DBus 的只读 `LAN2Status`，不使用启动
@@ -142,11 +144,11 @@ H5 页面可直接启用或停用智能限时，并设置 1 到 1440 分钟的�
 POST /api/v1/limiter
 Content-Type: application/json
 
-{"enabled":true,"max_watch_minutes":20,"block_seconds":6}
+{"enabled":true,"max_watch_minutes":20,"block_min_seconds":1,"block_max_seconds":26}
 ```
 
-`block_seconds` 可省略以兼容旧客户端；省略时保留当前阻断时长。
-智能限时保持启用时，修改 `max_watch_minutes` 或 `block_seconds` 不会清空
+四个字段均为必填；旧 `block_seconds` 请求不再兼容。智能限时保持启用时，
+修改 `max_watch_minutes`、`block_min_seconds` 或 `block_max_seconds` 不会清空
 当前计时，也不会退出干预或冷却状态。
 
 观看期间可由家长立即进入干预：

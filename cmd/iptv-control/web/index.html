@@ -39,9 +39,11 @@
     </label>
     <label for="max-watch-minutes">单次最长看电视时间（分钟）</label>
     <input id="max-watch-minutes" type="number" min="1" max="1440" step="1" value="20">
-    <label for="block-seconds">每分钟阻断时长（秒）</label>
-    <input id="block-seconds" type="number" min="1" max="25" step="1" value="6">
-    <p class="hint">达到限时后，每分钟将按设置短暂断开 LAN2。保持启用时修改参数不会清空当前计时或退出干预。</p>
+    <label for="block-min-seconds">每 30 秒最短阻断（秒）</label>
+    <input id="block-min-seconds" type="number" min="1" max="26" step="1" value="1">
+    <label for="block-max-seconds">每 30 秒最长阻断（秒）</label>
+    <input id="block-max-seconds" type="number" min="1" max="26" step="1" value="26">
+    <p class="hint">达到限时后，每 30 秒随机阻断一次。保持启用时修改参数不会清空当前计时或退出干预。</p>
     <button id="save-limiter">保存智能限时设置</button>
     <button id="intervene-now" disabled>立即进入干预（仅观看期间）</button>
     <p id="message"></p>
@@ -70,7 +72,8 @@
 
   $('limiter-enabled').addEventListener('change', () => settingsDirty = true);
   $('max-watch-minutes').addEventListener('input', () => settingsDirty = true);
-  $('block-seconds').addEventListener('input', () => settingsDirty = true);
+  $('block-min-seconds').addEventListener('input', () => settingsDirty = true);
+  $('block-max-seconds').addEventListener('input', () => settingsDirty = true);
 
   async function request(url, options) {
     const response = await fetch(url, options);
@@ -106,7 +109,8 @@
     if (!settingsLoaded || !settingsDirty) {
       $('limiter-enabled').checked = limiter.enabled;
       $('max-watch-minutes').value = limiter.watch_limit_minutes;
-      $('block-seconds').value = limiter.block_seconds;
+      $('block-min-seconds').value = limiter.block_min_seconds;
+      $('block-max-seconds').value = limiter.block_max_seconds;
       settingsLoaded = true;
       settingsDirty = false;
     }
@@ -138,13 +142,19 @@
 
   async function saveLimiter() {
     const minutes = Number($('max-watch-minutes').value);
-    const blockSeconds = Number($('block-seconds').value);
+    const blockMinSeconds = Number($('block-min-seconds').value);
+    const blockMaxSeconds = Number($('block-max-seconds').value);
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
       $('message').textContent = '最长观看时间必须是 1 到 1440 之间的整数分钟。';
       return;
     }
-    if (!Number.isInteger(blockSeconds) || blockSeconds < 1 || blockSeconds > 25) {
-      $('message').textContent = '每分钟阻断时长必须是 1 到 25 之间的整数秒。';
+    if (!Number.isInteger(blockMinSeconds) || blockMinSeconds < 1 || blockMinSeconds > 26 ||
+        !Number.isInteger(blockMaxSeconds) || blockMaxSeconds < 1 || blockMaxSeconds > 26) {
+      $('message').textContent = '最短和最长阻断时长必须是 1 到 26 之间的整数秒。';
+	  return;
+	}
+	if (blockMinSeconds > blockMaxSeconds) {
+	  $('message').textContent = '最短阻断时长不能大于最长阻断时长。';
       return;
     }
     $('save-limiter').disabled = true;
@@ -156,7 +166,8 @@
         body: JSON.stringify({
           enabled: $('limiter-enabled').checked,
           max_watch_minutes: minutes,
-          block_seconds: blockSeconds
+          block_min_seconds: blockMinSeconds,
+          block_max_seconds: blockMaxSeconds
         })
       });
       settingsDirty = false;

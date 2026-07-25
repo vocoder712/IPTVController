@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-func TestStateStoreLoadsLegacyRecordWithoutBlockDuration(t *testing.T) {
+func TestStateStoreRejectsPreviousVersion(t *testing.T) {
 	type legacyState struct {
 		Version            int    `json:"version"`
 		Sequence           uint64 `json:"sequence"`
@@ -23,7 +24,7 @@ func TestStateStoreLoadsLegacyRecordWithoutBlockDuration(t *testing.T) {
 		Phase              string `json:"phase"`
 	}
 	legacy := legacyState{
-		Version:           persistedStateVersion,
+		Version:           persistedStateVersion - 1,
 		Sequence:          7,
 		SavedAt:           "2026-07-24T12:00:00Z",
 		Enabled:           true,
@@ -40,12 +41,15 @@ func TestStateStoreLoadsLegacyRecordWithoutBlockDuration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := newStateStore(path).Load()
-	if err != nil {
+	store := newStateStore(path)
+	if _, err := store.Load(); !errors.Is(err, errStateVersionMismatch) {
+		t.Fatalf("error=%v, want version mismatch", err)
+	}
+	if err := store.Clear(); err != nil {
 		t.Fatal(err)
 	}
-	if got.Sequence != 7 || got.WatchLimitSeconds != 300 || got.DownDurationSeconds != 0 {
-		t.Fatalf("unexpected legacy state: %+v", got)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old state log still exists: %v", err)
 	}
 }
 
@@ -127,11 +131,12 @@ func TestLimiterRestoresAccumulatedWatchingTime(t *testing.T) {
 	cfg.Enabled = false
 	m := newLimiterMachine(cfg)
 	if err := m.Restore(persistedLimiterState{
-		Enabled:             true,
-		WatchLimitSeconds:   20 * 60,
-		DownDurationSeconds: 17,
-		AccumulatedSeconds:  10 * 60,
-		Phase:               string(LimiterWatching),
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 7,
+		MaxDownDurationSeconds: 17,
+		AccumulatedSeconds:     10 * 60,
+		Phase:                  string(LimiterWatching),
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -140,49 +145,49 @@ func TestLimiterRestoresAccumulatedWatchingTime(t *testing.T) {
 	m.Step(context.Background(), start, watchingStatus(), set)
 	snapshot := m.Snapshot(start)
 	if snapshot.State != LimiterWatching || snapshot.WatchedDuration != 10*time.Minute ||
-		snapshot.BlockSeconds != 17 {
+		snapshot.BlockMinSeconds != 7 || snapshot.BlockMaxSeconds != 17 {
 		t.Fatalf("unexpected restored watching state: %+v", snapshot)
 	}
 	m.Step(context.Background(), start.Add(10*time.Minute), watchingStatus(), set)
 	snapshot = m.Snapshot(start.Add(10 * time.Minute))
-	if snapshot.State != LimiterInterventionUp {
-		t.Fatalf("state=%s, want intervention_up", snapshot.State)
+	if snapshot.State != LimiterInterventionDown {
+		t.Fatalf("state=%s, want intervention_down", snapshot.State)
 	}
 }
 
-func TestLimiterRestoresLegacyStateWithDefaultBlockDuration(t *testing.T) {
+func TestLimiterRejectsPersistedStateWithoutBlockRange(t *testing.T) {
 	cfg := defaultLimiterConfig()
 	m := newLimiterMachine(cfg)
 	if err := m.Restore(persistedLimiterState{
 		Enabled:           true,
 		WatchLimitSeconds: 20 * 60,
 		Phase:             string(LimiterIdle),
-	}, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if got := m.Snapshot(time.Now()).BlockSeconds; got != 6 {
-		t.Fatalf("legacy block duration=%d, want 6", got)
+	}, time.Now()); err == nil {
+		t.Fatal("expected missing block range to fail")
 	}
 }
 
-func TestLimiterRejectsInvalidPersistedBlockDuration(t *testing.T) {
+func TestLimiterRejectsInvalidPersistedBlockRange(t *testing.T) {
 	m := newLimiterMachine(defaultLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
-		Enabled:             true,
-		WatchLimitSeconds:   20 * 60,
-		DownDurationSeconds: 26,
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 20,
+		MaxDownDurationSeconds: 10,
 	}, time.Now()); err == nil {
 		t.Fatal("expected invalid persisted block duration")
 	}
 }
 
-func TestLimiterRestoresInterventionAsUpOnly(t *testing.T) {
+func TestLimiterRestoresInterventionByStartingNewDownCycle(t *testing.T) {
 	m := newLimiterMachine(testLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
-		Enabled:            true,
-		WatchLimitSeconds:  20 * 60,
-		AccumulatedSeconds: 20 * 60,
-		Phase:              string(LimiterInterventionDown),
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 6,
+		MaxDownDurationSeconds: 6,
+		AccumulatedSeconds:     20 * 60,
+		Phase:                  string(LimiterInterventionDown),
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -193,21 +198,23 @@ func TestLimiterRestoresInterventionAsUpOnly(t *testing.T) {
 		return nil
 	})
 	snapshot := m.Snapshot(now)
-	if snapshot.State != LimiterInterventionUp || snapshot.NextAction.IsZero() {
+	if snapshot.State != LimiterInterventionDown || snapshot.NextAction.IsZero() {
 		t.Fatalf("unexpected restored intervention: %+v", snapshot)
 	}
-	if len(actions) != 0 {
-		t.Fatalf("restore performed port action: %v", actions)
+	if len(actions) != 1 || actions[0] {
+		t.Fatalf("restore did not start a down cycle: %v", actions)
 	}
 }
 
 func TestRestoredProgressEntersCooldownWhenCarrierIsOff(t *testing.T) {
 	m := newLimiterMachine(testLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
-		Enabled:            true,
-		WatchLimitSeconds:  20 * 60,
-		AccumulatedSeconds: 10 * 60,
-		Phase:              string(LimiterWatching),
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 6,
+		MaxDownDurationSeconds: 6,
+		AccumulatedSeconds:     10 * 60,
+		Phase:                  string(LimiterWatching),
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -229,11 +236,13 @@ func TestLimiterRestoresUnexpiredCooldown(t *testing.T) {
 	until := now.Add(17 * time.Minute)
 	m := newLimiterMachine(testLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
-		Enabled:            true,
-		WatchLimitSeconds:  20 * 60,
-		AccumulatedSeconds: 8 * 60,
-		Phase:              string(LimiterCooldown),
-		CooldownUntil:      until.Format(time.RFC3339Nano),
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 6,
+		MaxDownDurationSeconds: 6,
+		AccumulatedSeconds:     8 * 60,
+		Phase:                  string(LimiterCooldown),
+		CooldownUntil:          until.Format(time.RFC3339Nano),
 	}, now); err != nil {
 		t.Fatal(err)
 	}
@@ -283,11 +292,13 @@ func TestLimiterDiscardsExpiredCooldown(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	m := newLimiterMachine(testLimiterConfig())
 	if err := m.Restore(persistedLimiterState{
-		Enabled:            true,
-		WatchLimitSeconds:  20 * 60,
-		AccumulatedSeconds: 8 * 60,
-		Phase:              string(LimiterCooldown),
-		CooldownUntil:      now.Add(-time.Second).Format(time.RFC3339Nano),
+		Enabled:                true,
+		WatchLimitSeconds:      20 * 60,
+		MinDownDurationSeconds: 6,
+		MaxDownDurationSeconds: 6,
+		AccumulatedSeconds:     8 * 60,
+		Phase:                  string(LimiterCooldown),
+		CooldownUntil:          now.Add(-time.Second).Format(time.RFC3339Nano),
 	}, now); err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +321,7 @@ func TestStatePersisterCoalescesWritesWithinMinimumGap(t *testing.T) {
 	if err := p.FlushDue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpdateSettings(context.Background(), true, 30*time.Minute, 18*time.Second, func(context.Context, bool) error {
+	if err := m.UpdateSettings(context.Background(), true, 30*time.Minute, 8*time.Second, 18*time.Second, func(context.Context, bool) error {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -339,8 +350,8 @@ func TestStatePersisterCoalescesWritesWithinMinimumGap(t *testing.T) {
 	if after.WatchLimitSeconds != 30*60 {
 		t.Fatalf("coalesced state was not flushed: %+v", after)
 	}
-	if after.DownDurationSeconds != 18 {
-		t.Fatalf("block duration was not persisted: %+v", after)
+	if after.MinDownDurationSeconds != 8 || after.MaxDownDurationSeconds != 18 {
+		t.Fatalf("block range was not persisted: %+v", after)
 	}
 }
 

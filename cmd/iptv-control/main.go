@@ -278,29 +278,33 @@ func (a *app) limiterSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled         *bool `json:"enabled"`
 		MaxWatchMinutes *int  `json:"max_watch_minutes"`
-		BlockSeconds    *int  `json:"block_seconds"`
+		BlockMinSeconds *int  `json:"block_min_seconds"`
+		BlockMaxSeconds *int  `json:"block_max_seconds"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Enabled == nil || req.MaxWatchMinutes == nil {
-		http.Error(w, "enabled and max_watch_minutes are required", http.StatusBadRequest)
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Enabled == nil || req.MaxWatchMinutes == nil ||
+		req.BlockMinSeconds == nil || req.BlockMaxSeconds == nil {
+		http.Error(w, "enabled, max_watch_minutes, block_min_seconds and block_max_seconds are required", http.StatusBadRequest)
 		return
 	}
 	if *req.MaxWatchMinutes < 1 || *req.MaxWatchMinutes > 24*60 {
 		http.Error(w, "max_watch_minutes must be between 1 and 1440", http.StatusBadRequest)
 		return
 	}
-	blockSeconds := a.limiter.Snapshot(a.nowTime()).BlockSeconds
-	if req.BlockSeconds != nil {
-		blockSeconds = *req.BlockSeconds
+	if *req.BlockMinSeconds < minBlockSeconds || *req.BlockMinSeconds > maxBlockSeconds ||
+		*req.BlockMaxSeconds < minBlockSeconds || *req.BlockMaxSeconds > maxBlockSeconds {
+		http.Error(w, "block_min_seconds and block_max_seconds must be between 1 and 26", http.StatusBadRequest)
+		return
 	}
-	if blockSeconds < minBlockSeconds || blockSeconds > maxBlockSeconds {
-		http.Error(w, "block_seconds must be between 1 and 25", http.StatusBadRequest)
+	if *req.BlockMinSeconds > *req.BlockMaxSeconds {
+		http.Error(w, "block_min_seconds must not exceed block_max_seconds", http.StatusBadRequest)
 		return
 	}
 	if err := a.limiter.UpdateSettings(
 		r.Context(),
 		*req.Enabled,
 		time.Duration(*req.MaxWatchMinutes)*time.Minute,
-		time.Duration(blockSeconds)*time.Second,
+		time.Duration(*req.BlockMinSeconds)*time.Second,
+		time.Duration(*req.BlockMaxSeconds)*time.Second,
 		a.controller.SetEnabled,
 	); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -334,7 +338,7 @@ func restorePortAfterLoad(
 		return setEnabled(ctx, false)
 	case loadedPhase == string(LimiterCooldown):
 		return setEnabled(ctx, true)
-	case restoredState == LimiterInterventionUp:
+	case restoredState == LimiterInterventionUp || restoredState == LimiterInterventionDown:
 		return setEnabled(ctx, true)
 	default:
 		return nil
@@ -350,12 +354,13 @@ func (a *app) intervene(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "limiter is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err := a.limiter.StartIntervention(a.nowTime()); err != nil {
+	err := a.limiter.StartIntervention(r.Context(), a.nowTime(), a.controller.SetEnabled)
+	if a.persister != nil && a.limiter.Snapshot(a.nowTime()).State == LimiterInterventionDown {
+		a.persister.Request(true)
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
-	}
-	if a.persister != nil {
-		a.persister.Request(true)
 	}
 	writeJSON(w, http.StatusOK, a.readStatus(r.Context()))
 }
@@ -421,6 +426,12 @@ func main() {
 				); err != nil {
 					log.Printf("warning: reconcile LAN2 after limiter restore failed: %v", err)
 				}
+			}
+		case errors.Is(loadErr, errStateVersionMismatch):
+			if clearErr := store.Clear(); clearErr != nil {
+				log.Printf("warning: clear incompatible limiter state failed: %v", clearErr)
+			} else {
+				log.Printf("incompatible limiter state cleared; using defaults")
 			}
 		case !errors.Is(loadErr, os.ErrNotExist):
 			log.Printf("warning: load limiter state failed: %v", loadErr)
